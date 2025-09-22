@@ -1,12 +1,65 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import math
 
 if torch.cuda.is_available():
     device = torch.device('cuda')
 else:
     device = torch.device('cpu')
 
+class EmbeddingWithProjection(nn.Module):
+    def __init__(self, vocab_size, d_embed, d_model, max_position_embeddings=512, dropout=0.1):
+        super().__init__()
+        self.d_model = d_model
+        self.d_embed = d_embed
+        self.vocab_size = vocab_size
+        self.embedding = nn.Embedding(self.vocab_size, self.d_embed)
+        self.projection = nn.Linear(self.d_embed, self.d_model)
+        self.scaling = float(math.sqrt(self.d_model))
+        self.layernorm = nn.LayerNorm(self.d_model)
+        self.dropout = nn.Drouput(p=dropout)
+    
+    @staticmethod
+    def create_positional_encoding(seq_length, d_model, batch_size=1):
+        position = torch.arange(seq_length).unsqueeze(1).float()
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe = torch.zeros(seq_length, d_model)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0).expand(batch_size, -1, -1)
+        return pe
 
+    def forward(self, x):
+        assert x.dtype == torch.long, f"Input tensor must have dtype torch.long, got {x.dtype}"
+        batch_size, seq_length = x.size()
+        token_embedding = self.embedding(x)
+        token_embedding = self.projection(token_embedding) * self.scaling
+        positional_encoding = self.create_positional_encoding(seq_length, self.d_model, batch_size)
+        normalized_sum = self.layernorm(token_embedding + positional_encoding)
+        final_output = self.droput(normalized_sum)
+        return final output
+
+class TransformerAttention(nn.Module):
+    def __init__(self, d_model, num_head, dropout=0.1, bias=True):
+        super().__init__()
+        assert d_model % num_head == 0, "d_model must be divisible by num_head"
+        self.d_model = d_model
+        self.num_head = num_head
+        self.d_head = d_model//num_head
+        self.dropout_rate = dropout
+        self.q_proj = nn.Linear(d_model, d_model, bias=bias)
+        self.k_proj = nn.Linear(d_model, d_model, bias=bias)
+        self.v_proj = nn.Linear(d_model, d_model, bias=bias)
+        self.output_proj = nn.Linear(d_model, d_model, bias=bias)
+        self.dropout = nn.Dropout(p=dropout)
+        self.scaler = float(1.0 / math.sqrt(self.d_head))
+
+    def forward(self, sequence, key_value_states=None, att_mask=None):
+        batch_size, seq_len, model_dim = sequence.size()
+        assert model_dim == self.d_model, f"Input dimension {model_dim} doesn't match model dimension {self.d_model}"
+        
 class RoleAssignmentLSTM(nn.Module):
     def __init__(
             self,
