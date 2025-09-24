@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 
 from binding_operations import CircularConvolution, EltWise, SumFlattenedOuterProduct
-from .role_assigner import RoleAssignmentLSTM
+from .role_assigner import RoleAssignmentTransformer
 
 if torch.cuda.is_available():
     device = torch.device('cuda')
@@ -81,7 +81,7 @@ class RoleLearningTensorProductEncoder(nn.Module):
             )
             self.filler_embedding.weight.requires_grad = False
 
-        self.role_assigner = RoleAssignmentLSTM(
+        self.role_assigner = RoleAssignmentTransformer(
             self.n_roles,
             self.filler_embedding,
             role_learner_hidden_dim,
