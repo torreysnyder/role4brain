@@ -129,4 +129,15 @@ if __name__ == "__main__":
     filler_lengths = [2, 1]
     data_tensor = torch.tensor(data)
     padding_mask = transformer.create_padding_mask(data_tensor, filler_lengths)
-    roles 
+    roles, role_predictions = transformer(data_tensor, src_key_padding_mask=padding_mask)
+    print("Roles shape:", roles.shape)
+    print("Role predictions shape:", role_predictions.shape)
+    print("Role predictions for first sequence, first position:", role_predictions[0, 0, :])
+    print('\nTesting with single sequence:')
+    data2 = [[1, 10, 10, 10]]
+    filler_lengths2 = [1]
+    data_tensor2 = torch.tensor(data2)
+    padding_mask2 = transformer.create_padding_mask(data_tensor2, filler_lengths2)
+    roles2, role_predictions2 = transformer(data_tensor2, src_key_padding_mask=padding_mask2)
+    print("Roles shape:", roles2.shape)
+    print("Role predictions shape:", role_predictions2.shape)
