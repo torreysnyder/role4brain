@@ -25,8 +25,17 @@ class RoleLearningTensorProductEncoder(nn.Module):
             pretrained_filler_embeddings=None,
             embedder_squeeze=None,
             binder="tpr",
+            d_model=64,
+            nhead=8,
+            num_encoder_layers=4,
+            dim_feedforward=512,
+            dropout=0.1
             role_learner_hidden_dim=20,
             role_assignment_shrink_filler_dim=None,
+            use_positional_encoding=True,
+            use_gumbel_softmax=True,
+            gumbel_temperature=1.0,
+            gumbel_hard=False,
             bidirectional=False,
             num_layers=1,
             softmax_roles=False,
@@ -82,16 +91,22 @@ class RoleLearningTensorProductEncoder(nn.Module):
             self.filler_embedding.weight.requires_grad = False
 
         self.role_assigner = RoleAssignmentTransformer(
-            self.n_roles,
-            self.filler_embedding,
-            role_learner_hidden_dim,
-            self.role_dim,
+            num_roles=self.n_roles,
+            filler_embedding=self.filler_embedding,
+            d_model=d_model
+            role_embedding_dim=self.role_dim,
+            nhead=nhead,
+            num_encoder_layers=num_encoder_layers,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
             role_assignment_shrink_filler_dim=role_assignment_shrink_filler_dim,
-            bidirectional=bidirectional,
-            num_layers=num_layers,
-            softmax_roles=softmax_roles
+            softmax_roles=softmax_roles,
+            use_positional_encoding=use_positional_encoding,
+            use_gumbel_softmax=use_gumbel_softmax,
+            gumbel_temperature=gumbel_temperature,
+            gumbel_hard=gumbel_hard
         )
-
+        self.use_gumbel_softmax = use_gumbel_softmax
         # Create a SumFlattenedOuterProduct layer that will
         # take the sum flattened outer product of the filler
         # and role embeddings (or a different type of role-filler
@@ -146,6 +161,14 @@ class RoleLearningTensorProductEncoder(nn.Module):
     def set_regularization_temp(self, temp):
         self.regularization_temp = temp
 
+    def set_gumbel_temperature(self, temperature):
+        if hasattr(self.role_assigner, 'set_gumbel_temperature'):
+            self.role_assigner.set_gumbel_temperature(temperature)
+
+    def set_gumbel_hard(self, hard):
+        if hasattr(self.role_assigner, 'set_gumbel_hard'):
+            self.role_assigner.set_gumbel_hard(hard)
+            
     def get_regularization_loss(self, role_predictions):
         if not self.regularize:
             return 0, 0, 0
@@ -179,8 +202,33 @@ class RoleLearningTensorProductEncoder(nn.Module):
                self.l2_norm_regularization_weight * l2_norm_loss,\
                self.unique_role_regularization_weight * unique_role_loss
 
-    def train(self):
-        self.role_assigner.snap_one_hot_predictions = False
+    def train(self, mode=True):
+        super().train(mode)
+        if mode:
+            if self.use_gumbel_softmax:
+                self.role_assigner.snap_one_hot_predictions = False
+            else:
+                self.role_assigner.snap_one_hot_predictions = False
+        else:
+            if self.use_gumbel_softmax:
+                pass
+            else:
+                self.role_assigner.snap_one_hot_predictions = True
 
     def eval(self):
-        self.role_assigner.snap_one_hot_predictions = True
+        self.train(False)
+
+    def get_role_assignments(self, filler_list, filler_lengths=None):
+        with torch.no_grad():
+            src_key_padding_mask = None
+            if filler_lengths is not None:
+                src_key_padding_mask = self.role_assigner.create_padding_mask(filler_list, filler_lengths)
+            _, role_predictions = self.role_assigner(filler_list, src_key_padding_mask)
+            return role_predictions
+
+    def anneal_gumbel_temperature(self, epoch, initial_temp=2.0, final_temp=0.1, decay_rate=0.95):
+        if self.use_gumbel_softmax:
+            temp = max(final_temp, initial_temp * (decay_rate ** epoch))
+            self.set_gumbel_temperature(temp)
+            return temp
+        return None
