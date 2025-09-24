@@ -35,13 +35,23 @@ class RoleAssignmentTransformer(nn.Module):
         dropout=0.1,
         role_assignment_shrink_filler_dim=None,
         softmax_roles=False,
-        use_positional_encoding=True
+        use_positional_encoding=True,
+        gumbel_temperature=1.0,
+        gumbel_hard=False
     ):
         super(RoleAssignmentTransformer, self).__init__()
         self.snap_one_hot_predictions = False
         self.filler_embedding = filler_embedding
         self.d_model = d_model
         self.use_positional_encoding = use_positional_encoding
+
+        self.use_gumbel_softmax = use_gumbel_softmax
+        self.gumbel_temperature = gumbel_temperature
+        self.gumbel_hard = gumbel_hard
+
+        if use_gumbel_softmax:
+            print(f"Using Gumbel Softmax with temperature={gumbel_temperature}, hard={gumbel_hard}")
+            
         filler_embedding_dim = filler_embedding.embedding_dim
         self.shrink_filler = False
         if role_assignment_shrink_filler_dim:
@@ -86,12 +96,31 @@ class RoleAssignmentTransformer(nn.Module):
             role_predictions = self.softmax(role_predictions)
         role_embeddings = self.role_embeddings(self.role_indices)
         role_embeddings = role_embeddings/ torch.norm(role_embeddings, dim=1).unsqueeze(1)
-        if self.snap_one_hot_predictions:
+        if self.use_gumbel_softmax:
+            gumbel_predictions = self.gumbel_softmax(role_predictions, temperature=self.gumbel_temperature, hard=self.gumbel_hard)
+            roles = torch.matmul(gumbel_predictions, role_embeddings)
+        elif self.snap_one_hot_predictions:
             one_hot_predictions = self.one_hot_embedding(torch.argmax(role_predictions, 2), self.num_roles)
             roles = torch.matmul(one_hot_predictions, role_embeddings)
         else:
             roles = torch.matmul(role_predictions, role_embeddings)
         return roles, role_predictions
+
+    def gumbel_softmax(self, logits, temperature=1.0, hard=False, dim=1):
+        gumbel_noise = -torch.log(-torch.log(torch.rand_like(logits) + 1e-20) + 1e-20)
+        gumbel_logits = (logits + gumbel_noise) / temperature
+        soft_sample = torch.softmax(gumbel_logits, dim=dim)
+        if hard:
+            hard_sample = torch.zeros_like(soft_sample)
+            hard_sample.scatter_(dim, soft_sample.argmax(dim=dim, keepdim=True), 1.0)
+            soft_sample = hard_sample = soft_sample.detach() + soft_sample
+        return soft_sample
+
+    def set_gumbel_temperature(self, temperature):
+        self.gumbel_temperature = temperature
+
+    def set_gumbel_hard(self, hard):
+        self.gumbel_hard = hard
 
     def create_padding_mask(self, filler_tensor, filler_lengths):
         batch_size, seq_length = filler_tensor.shape
@@ -100,7 +129,7 @@ class RoleAssignmentTransformer(nn.Module):
             if length < seq_length:
                 mask[i, length:] = True
         return mask
-        
+       
     def one_hot_embedding(self, labels, num_classes):
         y = torch.eye(num_classes, device=device)
         return y[labels]
@@ -122,7 +151,10 @@ if __name__ == "__main__":
         dim_feedforward=256,
         dropout=0.1,
         softmax_roles=True,
-        use_positional_encoding=True
+        use_positional_encoding=True,
+        use_gumbel_softmax=True,
+        gumbel_temperature=1.0,
+        gumbel_hard=False
     )
     print("Testing with padded sequences:")
     data = [[2, 3, 10, 10], [1, 10, 10, 10]]
@@ -133,6 +165,20 @@ if __name__ == "__main__":
     print("Roles shape:", roles.shape)
     print("Role predictions shape:", role_predictions.shape)
     print("Role predictions for first sequence, first position:", role_predictions[0, 0, :])
+    print('\nTesting Gumbel temperature annealing:')
+    temperatures = [2.0, 1.0, 0.5, 0.1]
+    for temp in temperatures:
+        transformer.set_gumbel_temperature(temp)
+        roles_temp, _ = transformer(data_tensor, src_key_padding_mask=padding_mask)
+        print(f"Temperature {temp}: Gumbel output entropy = {-torch.sum(torch.softmax(role_predictions[0, 0, :], dim=0) * torch.log_softmax(role_predictions[0, 0, :], dim=0)):.3f}")
+    print('\nTesting hard vs soft Gumbel:')
+    transformer.set_gumbel_temperature(0.5)
+    transformer.set_gumbel_hard(False)
+    roles_soft, _ = transformer(data_tensor, src_key_padding_mask=padding_mask)
+    transformer.set_gumbel_hard(True)
+    roles_hard, _ = transformer(data_tensor, src_key_padding_mask=padding_mask)
+    print("Soft Gumbel max value:", torch.max(roles_soft).item())
+    print("Hard Gumbel max value:", torch.max(roles_hard).item())
     print('\nTesting with single sequence:')
     data2 = [[1, 10, 10, 10]]
     filler_lengths2 = [1]
