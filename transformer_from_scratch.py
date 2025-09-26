@@ -2,7 +2,6 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
 
 class EmbeddingWithProjection(nn.Module):
     def __init__(self, vocab_size, d_embed, d_model,
