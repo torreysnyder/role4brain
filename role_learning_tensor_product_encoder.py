@@ -42,11 +42,10 @@ class RoleLearningTensorProductEncoder(nn.Module):
             bidirectional=False,  # Not used in transformer
             num_layers=1,  # Replaced by num_encoder_layers
             softmax_roles=False,
-            # BERT embedding parameters
-            pretrained_embeddings=None,
-            bert_model_name=None,
+            # TPDN embedding parameters
+            tpdn_model_path=None,
+            tpdn_embeddings=None,
             freeze_embeddings=True,
-            untrained=False,
             # Regularization parameters
             one_hot_regularization_weight=1.0,
             l2_norm_regularization_weight=1.0,
@@ -69,13 +68,12 @@ class RoleLearningTensorProductEncoder(nn.Module):
         # Set the dimension for the role embeddings
         self.role_dim = role_dim
         
-        # Store BERT embedding configuration
+        # Store embedding configuration
         self.freeze_embeddings = freeze_embeddings
-        self.untrained = untrained
 
-        # Create an embedding layer for the fillers with BERT support
+        # Create an embedding layer for the fillers with TPDN support
         self._initialize_filler_embeddings(
-            pretrained_embeddings, bert_model_name, embedder_squeeze
+            tpdn_model_path, tpdn_embeddings, embedder_squeeze
         )
 
         # Create the Transformer-based role assigner
@@ -127,7 +125,7 @@ class RoleLearningTensorProductEncoder(nn.Module):
 
     # Function for a forward pass through this layer. Takes a list of fillers and
     # a list of roles and returns an single vector encoding it.
-    def forward(self, filler_list, role_list_not_used, filler_lengths=None):
+    def forward(self, filler_list, role_list_not_used=None, filler_lengths=None):
         """
         :param filler_list: Tensor of shape (batch_size, sequence_length)
         :param role_list_not_used: Not used (roles are learned by the transformer)
@@ -264,103 +262,83 @@ class RoleLearningTensorProductEncoder(nn.Module):
             return temp
         return None
     
-    def _initialize_filler_embeddings(self, pretrained_embeddings, bert_model_name, embedder_squeeze):
+    def _initialize_filler_embeddings(self, tpdn_model_path, tpdn_embeddings, embedder_squeeze):
         """
-        Initialize filler embeddings with support for BERT pretrained embeddings
+        Initialize filler embeddings from a trained TPDN model
+        
+        Args:
+            tpdn_model_path: Path to saved TPDN model state dict
+            tpdn_embeddings: Pre-extracted TPDN embeddings (numpy array)
+            embedder_squeeze: Optional dimension to squeeze embeddings to
         """
-        if pretrained_embeddings is not None:
-            # Use provided pretrained embeddings (BERT-style initialization)
-            embedding_dim = pretrained_embeddings.shape[1]
-            print(f"Using pretrained embeddings with dimension {embedding_dim}")
+        if tpdn_embeddings is not None:
+            # Use provided TPDN embeddings
+            embedding_dim = tpdn_embeddings.shape[1]
+            print(f"Using TPDN embeddings with dimension {embedding_dim}")
             
             if embedder_squeeze is None:
-                # Direct use of pretrained embeddings
+                # Direct use of TPDN embeddings
                 self.filler_embedding = nn.Embedding(self.n_fillers, embedding_dim)
                 self.embed_squeeze = False
                 
-                if not self.untrained:
-                    # Load the pretrained weights
-                    self.filler_embedding.weight.data = torch.from_numpy(pretrained_embeddings).float()
+                # Load the TPDN weights
+                self.filler_embedding.weight.data = torch.from_numpy(tpdn_embeddings).float()
                 
                 if self.freeze_embeddings:
                     self.filler_embedding.weight.requires_grad = False
-                    print("Pretrained embeddings frozen")
+                    print("TPDN embeddings frozen")
                 else:
-                    # Add a linear layer to allow fine-tuning while preserving pretrained knowledge
-                    frozen_embed = nn.Embedding(self.n_fillers, embedding_dim)
-                    frozen_embed.weight.data = torch.from_numpy(pretrained_embeddings).float()
-                    frozen_embed.weight.requires_grad = False
-                    
-                    self.filler_embedding = nn.Sequential(
-                        frozen_embed,
-                        nn.Linear(embedding_dim, self.filler_dim)
-                    )
-                    print("Pretrained embeddings with trainable linear layer")
+                    print("TPDN embeddings trainable")
                 
-                # Update filler_dim to match embedding dimension if no squeeze
-                if embedder_squeeze is None:
-                    self.filler_dim = embedding_dim
+                # Update filler_dim to match embedding dimension
+                self.filler_dim = embedding_dim
                     
             else:
-                # Use embedder squeeze with pretrained embeddings
+                # Use embedder squeeze with TPDN embeddings
                 self.embed_squeeze = True
-                self.filler_embedding = nn.Embedding(self.n_fillers, embedder_squeeze)
-                self.embedding_squeeze_layer = nn.Linear(embedder_squeeze, self.filler_dim)
+                self.filler_embedding = nn.Embedding(self.n_fillers, embedding_dim)
+                self.embedding_squeeze_layer = nn.Linear(embedding_dim, self.filler_dim)
                 
-                if not self.untrained:
-                    # For squeeze, we need to project pretrained embeddings to squeeze dimension
-                    pretrained_projected = torch.from_numpy(pretrained_embeddings).float()
-                    if pretrained_projected.size(1) != embedder_squeeze:
-                        # Create a projection layer to match dimensions
-                        proj_layer = nn.Linear(pretrained_projected.size(1), embedder_squeeze)
-                        with torch.no_grad():
-                            projected_embeddings = proj_layer(pretrained_projected)
-                        self.filler_embedding.weight.data = projected_embeddings
-                    else:
-                        self.filler_embedding.weight.data = pretrained_projected
+                # Load TPDN embeddings
+                self.filler_embedding.weight.data = torch.from_numpy(tpdn_embeddings).float()
                 
                 if self.freeze_embeddings:
                     self.filler_embedding.weight.requires_grad = False
+                    print(f"TPDN embeddings frozen with squeeze to {self.filler_dim} dimensions")
+                else:
+                    print(f"TPDN embeddings trainable with squeeze to {self.filler_dim} dimensions")
                 
-                print(f"Using pretrained embeddings with squeeze to {embedder_squeeze} dimensions")
-                
-        elif bert_model_name is not None:
-            # Load BERT embeddings directly from model name
-            print(f"Loading embeddings from BERT model: {bert_model_name}")
+        elif tpdn_model_path is not None:
+            # Load TPDN embeddings from saved model
+            print(f"Loading TPDN embeddings from model: {tpdn_model_path}")
             try:
-                from transformers import AutoModel, AutoTokenizer
-                tokenizer = AutoTokenizer.from_pretrained(bert_model_name, do_lower_case=True)
-                bert_model = AutoModel.from_pretrained(bert_model_name)
+                # Load the saved state dict
+                state_dict = torch.load(tpdn_model_path, map_location=device)
                 
-                # Extract embedding weights
-                bert_embeddings = bert_model.embeddings.word_embeddings.weight.detach().numpy()
-                embedding_dim = bert_embeddings.shape[1]
+                # Extract filler embeddings from the TPDN model
+                # The TPDN model has either 'filler_embed.weight' or 
+                # 'filler_embed.0.weight' (if using Sequential with linear layer)
+                if 'filler_embed.weight' in state_dict:
+                    tpdn_embed_weights = state_dict['filler_embed.weight'].cpu().numpy()
+                elif 'filler_embed.0.weight' in state_dict:
+                    tpdn_embed_weights = state_dict['filler_embed.0.weight'].cpu().numpy()
+                else:
+                    raise KeyError("Could not find filler embeddings in TPDN model state dict")
                 
-                # Initialize with BERT embeddings
-                self._initialize_filler_embeddings(bert_embeddings, None, embedder_squeeze)
-                print(f"Successfully loaded BERT embeddings with dimension {embedding_dim}")
+                embedding_dim = tpdn_embed_weights.shape[1]
+                print(f"Extracted TPDN embeddings with dimension {embedding_dim}")
                 
-            except ImportError:
-                print("Warning: transformers library not available. Using random embeddings.")
-                self._initialize_random_embeddings(embedder_squeeze)
+                # Initialize using the extracted embeddings
+                self._initialize_filler_embeddings(None, tpdn_embed_weights, embedder_squeeze)
+                
             except Exception as e:
-                print(f"Warning: Failed to load BERT model {bert_model_name}: {e}")
+                print(f"Warning: Failed to load TPDN model {tpdn_model_path}: {e}")
+                print("Falling back to random embeddings")
                 self._initialize_random_embeddings(embedder_squeeze)
                 
         else:
             # Use random embeddings (original behavior)
             self._initialize_random_embeddings(embedder_squeeze)
-            
-        # Handle legacy pretrained_filler_embeddings parameter
-        if hasattr(self, '_legacy_pretrained_filler_embeddings') and self._legacy_pretrained_filler_embeddings:
-            print('Loading legacy pretrained filler embeddings from file')
-            try:
-                self.filler_embedding.load_state_dict(
-                    torch.load(self._legacy_pretrained_filler_embeddings, map_location=device)
-                )
-                self.filler_embedding.weight.requires_grad = False
-            except Exception as e:
-                print(f"Warning: Failed to load legacy pretrained embeddings: {e}")
     
     def _initialize_random_embeddings(self, embedder_squeeze):
         """Initialize with random embeddings (original behavior)"""
@@ -375,48 +353,48 @@ class RoleLearningTensorProductEncoder(nn.Module):
             print(f"Using random embeddings with squeeze to {self.filler_dim} dimensions")
     
     @classmethod
-    def from_bert_model(cls, bert_model_name, tokenizer, id2token, **kwargs):
+    def from_tpdn_model(cls, tpdn_model_path, **kwargs):
         """
-        Convenient class method to create encoder with BERT embeddings
+        Convenient class method to create encoder with TPDN embeddings
         
         Args:
-            bert_model_name: Name of BERT model (e.g., 'bert-base-uncased')
-            tokenizer: BERT tokenizer
-            id2token: Dictionary mapping token IDs to tokens
+            tpdn_model_path: Path to saved TPDN model state dict
             **kwargs: Other initialization parameters
         """
+        return cls(tpdn_model_path=tpdn_model_path, **kwargs)
+    
+    @classmethod
+    def extract_tpdn_embeddings(cls, tpdn_model_path, n_fillers, filler_dim):
+        """
+        Extract filler embeddings from a trained TPDN model
+        
+        Args:
+            tpdn_model_path: Path to saved TPDN model state dict
+            n_fillers: Number of filler tokens
+            filler_dim: Expected dimension of filler embeddings
+            
+        Returns:
+            numpy array of shape (n_fillers, filler_dim) containing the embeddings
+        """
         try:
-            from transformers import AutoModel
+            state_dict = torch.load(tpdn_model_path, map_location=device)
             
-            # Load BERT model
-            bert_model = AutoModel.from_pretrained(bert_model_name)
+            # Extract filler embeddings
+            if 'filler_embed.weight' in state_dict:
+                embeddings = state_dict['filler_embed.weight'].cpu().numpy()
+            elif 'filler_embed.0.weight' in state_dict:
+                embeddings = state_dict['filler_embed.0.weight'].cpu().numpy()
+            else:
+                raise KeyError("Could not find filler embeddings in TPDN model")
             
-            # Extract embedding weights and create mapping
-            bert_weights = bert_model.embeddings.word_embeddings.weight.detach().numpy()
-            n_fillers = len(id2token)
-            embedding_dim = bert_weights.shape[1]
+            print(f"Extracted embeddings with shape {embeddings.shape}")
             
-            # Create pretrained embeddings array matching our vocabulary
-            pretrained_embeddings = np.random.rand(n_fillers, embedding_dim)
-            bert_token_ids = tokenizer.convert_tokens_to_ids([id2token[i] for i in range(n_fillers)])
+            # Verify dimensions match
+            if embeddings.shape[0] != n_fillers:
+                print(f"Warning: Embedding vocab size {embeddings.shape[0]} != expected {n_fillers}")
             
-            for i, bert_id in enumerate(bert_token_ids):
-                if bert_id < len(bert_weights):
-                    pretrained_embeddings[i] = bert_weights[bert_id]
+            return embeddings
             
-            print(f"Created BERT embeddings mapping for {n_fillers} tokens")
-            
-            # Set default parameters for BERT usage
-            if 'filler_dim' not in kwargs:
-                kwargs['filler_dim'] = embedding_dim
-            if 'n_fillers' not in kwargs:
-                kwargs['n_fillers'] = n_fillers
-                
-            return cls(pretrained_embeddings=pretrained_embeddings, **kwargs)
-            
-        except ImportError:
-            print("Warning: transformers library not available")
-            return cls(**kwargs)
         except Exception as e:
-            print(f"Warning: Failed to load BERT embeddings: {e}")
-            return cls(**kwargs)
+            print(f"Error extracting TPDN embeddings: {e}")
+            return None
