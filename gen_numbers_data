@@ -1,0 +1,45 @@
+import random
+import csv
+
+def generate_random_sequence(length=6, min_val=0, max_val=100):
+    """Generate a random sequence of numbers."""
+    return [random.randint(min_val, max_val) for _ in range(length)]
+
+def generate_dataset(num_items=50000, seq_length=6):
+    """Generate a dataset of random sequences."""
+    dataset = []
+    for _ in range(num_items):
+        sequence = generate_random_sequence(seq_length)
+        dataset.append(sequence)
+    return dataset
+
+def save_to_csv(dataset, filename='dataset.csv'):
+    """Save dataset to CSV file."""
+    with open(filename, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow([f'num_{i+1}' for i in range(len(dataset[0]))])
+        writer.writerows(dataset)
+    print(f"Dataset saved to {filename}")
+
+def save_to_txt(dataset, filename='dataset.txt'):
+    """Save dataset to text file."""
+    with open(filename, 'w') as f:
+        for seq in dataset:
+            f.write(','.join(map(str, seq)) + '\n')
+    print(f"Dataset saved to {filename}")
+
+# Generate the dataset
+print("Generating dataset...")
+dataset = generate_dataset(num_items=50000, seq_length=6)
+print(f"Generated {len(dataset)} sequences")
+
+# Save to CSV
+save_to_csv(dataset, 'random_sequences.csv')
+
+# Save to text file (optional)
+save_to_txt(dataset, 'random_sequences.txt')
+
+# Display first 10 sequences as sample
+print("\nFirst 10 sequences:")
+for i, seq in enumerate(dataset[:10], 1):
+    print(f"{i}: {seq}")
