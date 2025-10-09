@@ -25,7 +25,7 @@ def save_to_txt(dataset, filename='dataset.txt'):
     """Save dataset to text file."""
     with open(filename, 'w') as f:
         for seq in dataset:
-            f.write(','.join(map(str, seq)) + '\n')
+            f.write(' '.join(map(str, seq)) + '\n')
     print(f"Dataset saved to {filename}")
 
 # Generate the dataset
