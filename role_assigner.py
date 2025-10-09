@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import math
 
 if torch.cuda.is_available():
     device = torch.device('cuda')
@@ -8,209 +7,128 @@ else:
     device = torch.device('cpu')
 
 
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=5000):
-        super(PositionalEncoding, self).__init__()
-        
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0).transpose(0, 1)
-        
-        self.register_buffer('pe', pe)
-    
-    def forward(self, x):
-        return x + self.pe[:x.size(0), :]
-
-
-class RoleAssignmentTransformer(nn.Module):
+class RoleAssignmentLSTM(nn.Module):
     def __init__(
             self,
             num_roles,
             filler_embedding,
-            d_model,
+            hidden_dim,
             role_embedding_dim,
-            nhead=8,
-            num_encoder_layers=6,
-            dim_feedforward=2048,
-            dropout=0.1,
+            num_layers=1,
             role_assignment_shrink_filler_dim=None,
-            softmax_roles=False,
-            use_positional_encoding=True,
-            use_gumbel_softmax=False,
-            gumbel_temperature=1.0,
-            gumbel_hard=False
+            bidirectional=False,
+            softmax_roles=False
     ):
-        super(RoleAssignmentTransformer, self).__init__()
-        
+        super(RoleAssignmentLSTM, self).__init__()
+        # TODO: when we move to language models, we will need to use pre-trained word embeddings.
+        # See embedder_squeeze in TensorProductEncoder
+
         self.snap_one_hot_predictions = False
+
         self.filler_embedding = filler_embedding
-        self.d_model = d_model
-        self.use_positional_encoding = use_positional_encoding
-        
-        # Gumbel Softmax parameters
-        self.use_gumbel_softmax = use_gumbel_softmax
-        self.gumbel_temperature = gumbel_temperature
-        self.gumbel_hard = gumbel_hard
-        
-        if use_gumbel_softmax:
-            print(f"Using Gumbel Softmax with temperature={gumbel_temperature}, hard={gumbel_hard}")
-        
         filler_embedding_dim = filler_embedding.embedding_dim
-        
+
         self.shrink_filler = False
         if role_assignment_shrink_filler_dim:
             self.shrink_filler = True
             self.filler_shrink_layer = nn.Linear(filler_embedding.embedding_dim,
                                                  role_assignment_shrink_filler_dim)
             filler_embedding_dim = role_assignment_shrink_filler_dim
-        
-        # Project filler embeddings to d_model dimension if necessary
-        if filler_embedding_dim != d_model:
-            self.input_projection = nn.Linear(filler_embedding_dim, d_model)
-        else:
-            self.input_projection = nn.Identity()
-        
-        # Positional encoding
-        if self.use_positional_encoding:
-            self.pos_encoder = PositionalEncoding(d_model)
-        
-        # Transformer encoder
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            batch_first=False  # Keep sequence_length first for consistency
-        )
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_encoder_layers)
-        
-        # Role prediction head
+
+        self.num_layers = num_layers
+        self.hidden_dim = hidden_dim
         self.num_roles = num_roles
-        self.role_weight_predictions = nn.Linear(d_model, num_roles)
-        
+        self.bidirectional = bidirectional
+
+        # OPTION we may want the LSTM to be bidirectional for things like RTL roles.
+        # Also, should the output size be the number of roles for the weight vector?
+        # Or is the output of variable size and we apply a linear transformation
+        # to get the weight vector?
+        self.lstm = nn.LSTM(filler_embedding_dim, hidden_dim, bidirectional=bidirectional,
+                            num_layers=self.num_layers)
+        if bidirectional:
+            print("The role assignment LSTM is bidirectional")
+            self.role_weight_predictions = nn.Linear(hidden_dim * 2, num_roles)
+        else:
+            self.role_weight_predictions = nn.Linear(hidden_dim, num_roles)
+
         self.softmax_roles = softmax_roles
         if softmax_roles:
             print("Use softmax for role predictions")
+            # The output of role_weight_predictions is shape
+            # (sequence_length, batch_size, num_roles)
+            # We want to softmax across the roles so set dim=2
             self.softmax = nn.Softmax(dim=2)
-        
-        # Role embeddings
+
         self.role_embedding = nn.Embedding(num_roles, role_embedding_dim)
         self.role_indices = torch.tensor([x for x in range(num_roles)], device=device)
-        
-    def forward(self, filler_tensor, src_key_padding_mask=None):
+
+    def forward(self, filler_tensor):
         """
-        :param filler_tensor: Input tensor of shape (batch_size, sequence_length)
-        :param src_key_padding_mask: Optional mask for padded positions of shape (batch_size, sequence_length)
+        :param filler_tensor: This input tensor should be of shape (batch_size, sequence_length)
+        :param filler_lengths: A list of the length of each sequence in the batch. This is used
+            for padding the sequences.
         :return: A tensor of size (sequence_length, batch_size, role_embedding_dim) with the role
             embeddings for the input filler_tensor.
         """
-        batch_size, seq_length = filler_tensor.shape
-        
-        # Get filler embeddings
+        batch_size = len(filler_tensor)
+        hidden = self.init_hidden(batch_size)
+
         fillers_embedded = self.filler_embedding(filler_tensor)
         if self.shrink_filler:
             fillers_embedded = self.filler_shrink_layer(fillers_embedded)
-        
-        # Project to d_model dimension
-        fillers_embedded = self.input_projection(fillers_embedded)
-        
-        # Transpose to (sequence_length, batch_size, d_model) for transformer
+        # The shape of fillers_embedded should be
+        # (batch_size, sequence_length, filler_embedding_dim)
+        # Pytorch LSTM expects data in the shape (sequence_length, batch_size, feature_dim)
         fillers_embedded = torch.transpose(fillers_embedded, 0, 1)
-        
-        # Add positional encoding
-        if self.use_positional_encoding:
-            fillers_embedded = self.pos_encoder(fillers_embedded)
-        
-        # Apply transformer encoder
-        transformer_out = self.transformer_encoder(fillers_embedded, src_key_padding_mask=src_key_padding_mask)
-        
-        # Predict role weights
-        role_predictions = self.role_weight_predictions(transformer_out)
-        
+
+        '''
+        fillers_embedded = torch.nn.utils.rnn.pack_padded_sequence(
+            fillers_embedded,
+            filler_lengths,
+            batch_first=False
+        )
+
+        lstm_out, hidden = self.lstm(fillers_embedded, hidden)
+        lstm_out, _ = torch.nn.utils.rnn.pad_packed_sequence(lstm_out)
+        '''
+        lstm_out, hidden = self.lstm(fillers_embedded, hidden)
+        role_predictions = self.role_weight_predictions(lstm_out)
+
         if self.softmax_roles:
             role_predictions = self.softmax(role_predictions)
-        
-        # Get role embeddings
+        # role_predictions is size (sequence_length, batch_size, num_roles)
+
         role_embeddings = self.role_embedding(self.role_indices)
-        
-        # Normalize the embeddings
+
+        # Normalize the embeddings. This is important so that role attention is not overruled by
+        # embeddings with different orders of magnitude.
         role_embeddings = role_embeddings / torch.norm(role_embeddings, dim=1).unsqueeze(1)
-        
-        # Apply role predictions to get final roles
-        if self.use_gumbel_softmax:
-            # Use Gumbel Softmax for differentiable discrete sampling
-            gumbel_predictions = self.gumbel_softmax(role_predictions, 
-                                                    temperature=self.gumbel_temperature,
-                                                    hard=self.gumbel_hard)
-            roles = torch.matmul(gumbel_predictions, role_embeddings)
-        elif self.snap_one_hot_predictions:
+        # role_embeddings is size (num_roles, role_embedding_dim)
+
+        # During evaluation, we want to snap the role predictions to a one-hot vector
+        if self.snap_one_hot_predictions:
             one_hot_predictions = self.one_hot_embedding(torch.argmax(role_predictions, 2),
                                                         self.num_roles)
             roles = torch.matmul(one_hot_predictions, role_embeddings)
         else:
             roles = torch.matmul(role_predictions, role_embeddings)
-        
-        return roles, role_predictions
-    
-    def gumbel_softmax(self, logits, temperature=1.0, hard=False, dim=-1):
-        """
-        Sample from Gumbel Softmax distribution
-        
-        Args:
-            logits: [..., num_classes] unnormalized log probabilities
-            temperature: temperature parameter (lower = more discrete)
-            hard: if True, returns one-hot vector but maintains gradients
-            dim: dimension to apply softmax over
-            
-        Returns:
-            [..., num_classes] sampled tensor from Gumbel Softmax
-        """
-        # Sample from Gumbel distribution
-        gumbel_noise = -torch.log(-torch.log(torch.rand_like(logits) + 1e-20) + 1e-20)
-        
-        # Add Gumbel noise to logits and apply temperature
-        gumbel_logits = (logits + gumbel_noise) / temperature
-        
-        # Apply softmax
-        soft_sample = torch.softmax(gumbel_logits, dim=dim)
-        
-        if hard:
-            # Create hard one-hot vector but keep gradients from soft version
-            hard_sample = torch.zeros_like(soft_sample)
-            hard_sample.scatter_(dim, soft_sample.argmax(dim=dim, keepdim=True), 1.0)
-            # Use straight-through estimator: forward pass uses hard, backward pass uses soft
-            soft_sample = hard_sample - soft_sample.detach() + soft_sample
-            
-        return soft_sample
-    
-    def set_gumbel_temperature(self, temperature):
-        """Dynamically adjust Gumbel temperature during training"""
-        self.gumbel_temperature = temperature
-    
-    def set_gumbel_hard(self, hard):
-        """Switch between hard and soft Gumbel sampling"""
-        self.gumbel_hard = hard
+        # roles is size (sequence_length, batch_size, role_embedding_dim)
 
-    def create_padding_mask(self, filler_tensor, filler_lengths):
-        """
-        Create a padding mask for the transformer
-        :param filler_tensor: Input tensor of shape (batch_size, sequence_length)
-        :param filler_lengths: List of actual lengths for each sequence
-        :return: Padding mask of shape (batch_size, sequence_length)
-        """
-        batch_size, seq_length = filler_tensor.shape
-        mask = torch.zeros(batch_size, seq_length, dtype=torch.bool, device=device)
-        
-        for i, length in enumerate(filler_lengths):
-            if length < seq_length:
-                mask[i, length:] = True
-        
-        return mask
-    
+        return roles, role_predictions
+
+    def init_hidden(self, batch_size):
+        layer_multiplier = 1
+        if self.bidirectional:
+            layer_multiplier = 2
+
+        # The axes semantics are (num_layers, batch_size, hidden_dim)
+        # We need a tuple for the hidden state and the cell state of the LSTM.
+        return (torch.zeros(self.num_layers * layer_multiplier, batch_size, self.hidden_dim,
+                            device=device),
+                torch.zeros(self.num_layers * layer_multiplier, batch_size, self.hidden_dim,
+                            device=device))
+
     def one_hot_embedding(self, labels, num_classes):
         """Embedding labels to one-hot form.
 
@@ -231,7 +149,7 @@ if __name__ == "__main__":
     num_roles = 10
     filler_embedding_dim = 20
     num_fillers = 10
-    d_model = 64  # Transformer model dimension
+    hidden_dim = 30
     role_embedding_dim = 20
     filler_embedding = torch.nn.Embedding(
         num_fillers + 1,
@@ -239,59 +157,22 @@ if __name__ == "__main__":
         padding_idx=num_fillers
     )
 
-    transformer = RoleAssignmentTransformer(
-        num_roles=num_roles,
-        filler_embedding=filler_embedding,
-        d_model=d_model,
-        role_embedding_dim=role_embedding_dim,
-        nhead=8,
-        num_encoder_layers=4,
-        dim_feedforward=256,
-        dropout=0.1,
-        softmax_roles=True,
-        use_positional_encoding=True,
-        use_gumbel_softmax=True,
-        gumbel_temperature=1.0,
-        gumbel_hard=False
+    lstm = RoleAssignmentLSTM(
+        num_roles,
+        filler_embedding,
+        hidden_dim,
+        role_embedding_dim,
+        num_layers=2,
+        bidirectional=True,
     )
 
-    print("Testing with padded sequences:")
-    data = [[2, 3, 10, 10], [1, 10, 10, 10]]  # 10 is padding token
-    filler_lengths = [2, 1]
+    #data = [[1, 2, 3, 4], [1, 8, 1, 0]]
+    data = [[2, 3], [1, 10]]
     data_tensor = torch.tensor(data)
-    
-    # Create padding mask
-    padding_mask = transformer.create_padding_mask(data_tensor, filler_lengths)
-    
-    roles, role_predictions = transformer(data_tensor, src_key_padding_mask=padding_mask)
-    print("Roles shape:", roles.shape)
-    print("Role predictions shape:", role_predictions.shape)
-    print("Role predictions for first sequence, first position:", role_predictions[0, 0, :])
-    
-    print('\nTesting Gumbel temperature annealing:')
-    # Start with high temperature (soft) and gradually decrease (harder)
-    temperatures = [2.0, 1.0, 0.5, 0.1]
-    for temp in temperatures:
-        transformer.set_gumbel_temperature(temp)
-        roles_temp, _ = transformer(data_tensor, src_key_padding_mask=padding_mask)
-        print(f"Temperature {temp}: Gumbel output entropy = {-torch.sum(torch.softmax(role_predictions[0, 0, :], dim=0) * torch.log_softmax(role_predictions[0, 0, :], dim=0)):.3f}")
-    
-    print('\nTesting hard vs soft Gumbel:')
-    transformer.set_gumbel_temperature(0.5)
-    transformer.set_gumbel_hard(False)
-    roles_soft, _ = transformer(data_tensor, src_key_padding_mask=padding_mask)
-    
-    transformer.set_gumbel_hard(True)
-    roles_hard, _ = transformer(data_tensor, src_key_padding_mask=padding_mask)
-    print("Soft Gumbel max value:", torch.max(roles_soft).item())
-    print("Hard Gumbel max value:", torch.max(roles_hard).item())
-    
-    print('\nTesting with single sequence:')
-    data2 = [[1, 10, 10, 10]]
-    filler_lengths2 = [1]
+    out = lstm(data_tensor, [2, 1])
+    print(out)
+    print('experiment 2')
+    data2 = [[1]]
     data_tensor2 = torch.tensor(data2)
-    padding_mask2 = transformer.create_padding_mask(data_tensor2, filler_lengths2)
-    
-    roles2, role_predictions2 = transformer(data_tensor2, src_key_padding_mask=padding_mask2)
-    print("Roles shape:", roles2.shape)
-    print("Role predictions shape:", role_predictions2.shape)
+    out2 = lstm(data_tensor2, [1])
+    print(out2)
