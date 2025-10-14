@@ -6,10 +6,10 @@ Pipeline:
 2) Train a ROLE-style tensor-product encoder to reproduce those embeddings
 3) Train a Transformer decoder on the *true* TPDN embeddings
 4) Evaluate "substitution accuracy" by feeding ROLE's approximation to the decoder
-   -> Here we discretize role assignment via Gumbel-Softmax (soft or straight-through hard)
+   -> discretize role assignment via Gumbel-Softmax (soft or hard)
 
 This follows the ROLE evaluation idea of passing approximations through the decoder (substitution accuracy),
-but uses Gumbel-Softmax rather than snapping or discrete two-stage training. See ROLE paper §5.1.  # (paper)
+but uses Gumbel-Softmax rather than snapping or discrete two-stage training. 
 """
 
 import sys
@@ -672,3 +672,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
