@@ -1,225 +1,336 @@
-"""
-Simplified Role Learning Tensor Product Encoder
-Works with the RoleAssignmentLSTM module to learn roles from data
-"""
-
+from __future__ import division
+from typing import Optional
 import torch
 import torch.nn as nn
 
-if torch.cuda.is_available():
-    device = torch.device('cuda')
-else:
-    device = torch.device('cpu')
+# Import custom binding operations for different ways to combine fillers and roles
+from binding_operations import CircularConvolution, EltWise, SumFlattenedOuterProduct
+# NOTE: LSTM assigner no longer used
+# from role_assigner import RoleAssignmentLSTM
+
+# set device to GPU if available, otherwise CPU
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
-class SumFlattenedOuterProduct(nn.Module):
-    """Tensor product binding operation"""
-    def __init__(self):
-        super(SumFlattenedOuterProduct, self).__init__()
-    
-    def forward(self, input1, input2):
+# -----------------------------
+# Positional encoding (sinusoidal)
+# -----------------------------
+class PositionalEncoding(nn.Module):
+    """Standard sinusoidal positional encoding."""
+    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+        pe = torch.zeros(max_len, d_model, dtype=torch.float32)
+        position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float32) * (-torch.log(torch.tensor(10000.0)) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)  # (1, max_len, d_model)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
         """
-        Compute outer product between fillers and roles
-        input1: (batch_size, seq_len, filler_dim)
-        input2: (seq_len, batch_size, role_dim) or (batch_size, seq_len, role_dim)
+        x: (B, S, d_model)
         """
-        # Ensure input2 is in the right format
-        if input2.dim() == 3 and input2.size(0) != input1.size(0):
-            # input2 is (seq_len, batch_size, role_dim), transpose to (batch_size, seq_len, role_dim)
-            input2 = input2.transpose(0, 1)
-        
-        # Now both are (batch_size, seq_len, dim)
-        # Compute outer product: (batch_size, filler_dim, role_dim)
-        outer_product = torch.bmm(input1.transpose(1, 2), input2)
-        
-        # Flatten: (batch_size, filler_dim * role_dim)
-        flattened = outer_product.view(outer_product.size(0), -1)
-        
-        return flattened
+        x = x + self.pe[:, :x.size(1), :]
+        return self.dropout(x)
 
 
-class RoleLearningTensorProductEncoder(nn.Module):
+# -----------------------------
+# Transformer-based Role Assigner
+# -----------------------------
+class RoleAssignmentTransformer(nn.Module):
     """
-    Tensor Product Encoder with learned role assignments.
-    Uses RoleAssignmentLSTM to dynamically assign roles based on input.
+    Predicts a distribution over roles per token using a Transformer encoder,
+    and maps that distribution to role vectors via a learned role embedding table.
+
+    API matches the previous LSTM role assigner:
+      forward(fillers) -> (roles_embedded, role_predictions)
+        roles_embedded: (S, B, role_dim)
+        role_predictions: (S, B, n_roles)  (probs if softmax_roles=True, else logits)
     """
-    
     def __init__(
         self,
-        n_roles,
-        n_fillers,
-        filler_dim,
-        role_dim,
-        final_layer_width,
-        pretrained_filler_embeddings=None,
-        hidden_dim=32,
-        num_layers=1,
-        bidirectional=False,
-        softmax_roles=True,
-        binder="tpr",
-        # Regularization weights
-        one_hot_regularization_weight=0.1,
-        l2_norm_regularization_weight=0.1,
-        unique_role_regularization_weight=0.1,
-        **kwargs  # Catch unused arguments
+        n_roles: int,
+        filler_embedding: nn.Embedding,
+        model_dim: int,
+        role_dim: int,
+        *,
+        role_assignment_shrink_filler_dim: Optional[int] = None,
+        num_layers: int = 2,
+        nhead: int = 4,
+        dim_feedforward: int = 256,
+        dropout: float = 0.1,
+        softmax_roles: bool = True,
+    ):
+        super().__init__()
+        self.n_roles = n_roles
+        self.filler_embedding = filler_embedding
+        self.model_dim = model_dim
+        self.role_dim = role_dim
+        self.softmax_roles = softmax_roles
+
+        # Exposed so external code can find it (encode_with_gumbel relies on this)
+        self.role_embedding = nn.Embedding(n_roles, role_dim)
+
+        # Optionally shrink/expand filler embedding dimension to model_dim
+        filler_dim = filler_embedding.embedding_dim
+        if role_assignment_shrink_filler_dim is not None:
+            # First shrink to the requested size, then project to model_dim
+            self.pre_proj = nn.Sequential(
+                nn.Linear(filler_dim, role_assignment_shrink_filler_dim),
+                nn.ReLU(),
+                nn.Linear(role_assignment_shrink_filler_dim, model_dim),
+            )
+        elif filler_dim != model_dim:
+            self.pre_proj = nn.Linear(filler_dim, model_dim)
+        else:
+            self.pre_proj = nn.Identity()
+
+        self.pos_enc = PositionalEncoding(model_dim, dropout=dropout)
+
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=model_dim, nhead=nhead,
+            dim_feedforward=dim_feedforward, dropout=dropout,
+            batch_first=True  # (B, S, D)
+        )
+        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
+
+        # Head to predict role logits at each position
+        self.role_head = nn.Linear(model_dim, n_roles)
+
+        # Flag toggled by outer module's train()/eval() for one-hot snapping
+        self.snap_one_hot_predictions = False
+
+    def forward(self, filler_indices: torch.Tensor):
+        """
+        filler_indices: (B, S) Long
+        Returns:
+          roles_embedded: (S, B, role_dim)
+          role_predictions: (S, B, n_roles)   (probs if softmax_roles else logits)
+        """
+        # Embed fillers then project to model dimension
+        x = self.filler_embedding(filler_indices)  # (B, S, filler_dim)
+        x = self.pre_proj(x)                       # (B, S, model_dim)
+        x = self.pos_enc(x)                        # add positional info
+
+        # Transformer encoder over the sequence
+        h = self.encoder(x)                        # (B, S, model_dim)
+
+        # Role logits per position
+        role_logits = self.role_head(h)            # (B, S, n_roles)
+
+        if self.softmax_roles:
+            role_probs = torch.softmax(role_logits, dim=-1)  # (B, S, n_roles)
+        else:
+            role_probs = role_logits  # treat as unnormalized if desired
+
+        # Optionally snap to hard one-hot at inference
+        if self.snap_one_hot_predictions and self.softmax_roles:
+            idx = role_probs.argmax(dim=-1, keepdim=True)         # (B, S, 1)
+            one_hot = torch.zeros_like(role_probs).scatter_(-1, idx, 1.0)
+            role_weights = one_hot
+        else:
+            role_weights = role_probs
+
+        # Map role distribution → role vector via learned role embedding table
+        # roles_emb: (B, S, role_dim) = (B, S, n_roles) @ (n_roles, role_dim)
+        roles_emb = torch.einsum("bsr,rd->bsd", role_weights, self.role_embedding.weight)
+
+        # Return in (S, B, ...) to match the legacy interface used by the binder
+        roles_emb = roles_emb.transpose(0, 1)       # (S, B, role_dim)
+        role_pred = (role_probs if self.softmax_roles else role_logits).transpose(0, 1)  # (S, B, n_roles)
+        return roles_emb, role_pred
+
+
+# A tensor product encoder layer
+# Takes a list of fillers and a list of roles and returns an encoding
+class RoleLearningTensorProductEncoder(nn.Module):
+    """
+    Learns to encode sequences with Tensor Product Representations (TPRs):
+      - Filler embeddings (content)
+      - Role assignment (now Transformer-based)
+      - Binding op (TPR / HRR / eltwise)
+      - Optional final linear to match downstream dimensionality
+    """
+    def __init__(
+            self,
+            n_roles=6,
+            n_fillers=101,
+            filler_dim=64,
+            role_dim=32,
+            final_layer_width=None,
+            pretrained_filler_embeddings=None,
+            embedder_squeeze=None,
+            binder="tpr",
+            role_learner_hidden_dim=256,              # now 'model_dim' for the Transformer
+            role_assignment_shrink_filler_dim=None,
+            bidirectional=False,                     # kept for API compatibility (unused)
+            num_layers=4,
+            softmax_roles=True,
+            pretrained_embeddings=None,
+            one_hot_regularization_weight=2.0,
+            l2_norm_regularization_weight=1.0,
+            unique_role_regularization_weight=2.0,
+            # NEW hyperparams for transformer (optional advanced tuning)
+            nhead: int = 8,
+            dim_feedforward: int = 1024,
+            dropout: float = 0.1,
     ):
         super(RoleLearningTensorProductEncoder, self).__init__()
-        
         self.n_roles = n_roles
         self.n_fillers = n_fillers
-        self.filler_dim = filler_dim
-        self.role_dim = role_dim
-        self.final_layer_width = final_layer_width
-        
-        # Regularization parameters
+
         self.one_hot_regularization_weight = one_hot_regularization_weight
         self.l2_norm_regularization_weight = l2_norm_regularization_weight
         self.unique_role_regularization_weight = unique_role_regularization_weight
         self.regularize = False
-        self.regularization_temp = 1.0
-        
-        # Create filler embedding
-        if pretrained_filler_embeddings is not None:
-            self.filler_embedding = nn.Embedding(n_fillers, filler_dim)
-            self.filler_embedding.weight.data = torch.from_numpy(pretrained_filler_embeddings).float()
-            self.filler_embedding.weight.requires_grad = False
-            print("Using pretrained filler embeddings (frozen)")
+
+        self.filler_dim = filler_dim
+        self.role_dim = role_dim
+
+        # ---- Filler embedding (with optional squeeze) ----
+        if embedder_squeeze is None:
+            self.filler_embedding = nn.Embedding(self.n_fillers, self.filler_dim)
+            self.embed_squeeze = False
+            print("no squeeze")
         else:
-            self.filler_embedding = nn.Embedding(n_fillers, filler_dim)
-            print("Using random filler embeddings")
-        
-        # Import and create role assigner
-        try:
-            from role_assigner import RoleAssignmentLSTM
-            
-            self.role_assigner = RoleAssignmentLSTM(
-                num_roles=n_roles,
-                filler_embedding=self.filler_embedding,
-                hidden_dim=hidden_dim,
-                role_embedding_dim=role_dim,
-                num_layers=num_layers,
-                bidirectional=bidirectional,
-                softmax_roles=softmax_roles
-            )
-            print(f"Created LSTM role assigner (hidden_dim={hidden_dim}, softmax={softmax_roles})")
-        except ImportError:
-            print("ERROR: Could not import RoleAssignmentLSTM from role_assigner.py")
-            print("Make sure role_assigner.py is in the same directory")
-            raise
-        
-        # Create binding operation
+            self.embed_squeeze = True
+            self.filler_embedding = nn.Embedding(self.n_fillers, embedder_squeeze)
+            self.embedding_squeeze_layer = nn.Linear(embedder_squeeze, self.filler_dim)
+            print("squeeze")
+
+        if pretrained_embeddings is not None:
+            self.filler_embedding.load_state_dict({'weight': torch.FloatTensor(pretrained_embeddings).to(device)})
+            self.filler_embedding.weight.requires_grad = False
+
+        if pretrained_filler_embeddings:
+            print('Using pretrained filler embeddings')
+            self.filler_embedding.load_state_dict(torch.load(pretrained_filler_embeddings, map_location=device))
+            self.filler_embedding.weight.requires_grad = False
+
+        # ---- Transformer-based role assigner (replaces LSTM) ----
+        # role_learner_hidden_dim serves as the transformer model dimension
+        self.role_assigner = RoleAssignmentTransformer(
+            n_roles=self.n_roles,
+            filler_embedding=self.filler_embedding,
+            model_dim=role_learner_hidden_dim,
+            role_dim=self.role_dim,
+            role_assignment_shrink_filler_dim=role_assignment_shrink_filler_dim,
+            num_layers=max(1, num_layers),      # keep your CLI/API consistent
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            softmax_roles=softmax_roles,
+        )
+
+        # ---- Binding op ----
         if binder == "tpr":
             self.sum_layer = SumFlattenedOuterProduct()
+        elif binder == "hrr":
+            self.sum_layer = CircularConvolution(self.filler_dim)
+        elif binder in ("eltwise", "elt"):
+            self.sum_layer = EltWise()
         else:
-            raise ValueError(f"Only 'tpr' binder is currently supported, got {binder}")
-        
-        # Create final projection layer
-        self.last_layer = nn.Linear(filler_dim * role_dim, final_layer_width)
-        
-        print(f"Model created: {n_fillers} fillers, {n_roles} roles")
-        print(f"  Filler dim: {filler_dim}, Role dim: {role_dim}")
-        print(f"  Output dim: {final_layer_width}")
-    
-    def forward(self, filler_list, role_list_not_used=None, filler_lengths=None):
+            raise ValueError(f"Invalid binder: {binder}")
+
+        # ---- Optional final linear layer ----
+        self.final_layer_width = final_layer_width
+        if self.final_layer_width is None:
+            self.has_last = 0
+        else:
+            self.has_last = 1
+            if binder == "tpr":
+                # replace the single Linear with:
+                self.last_layer = nn.Sequential(
+                    nn.Linear(self.filler_dim * self.role_dim, max(512, self.final_layer_width)),
+                    nn.GELU(),
+                    nn.Linear(max(512, self.final_layer_width), self.final_layer_width),
+                )
+
+            else:
+                self.last_layer = nn.Linear(self.filler_dim, self.final_layer_width)
+
+    def forward(self, filler_list, role_list_not_used=None):
         """
-        Forward pass through the model.
-        
         Args:
-            filler_list: Tensor of shape (batch_size, seq_length) with filler IDs
-            role_list_not_used: Ignored (roles are learned)
-            filler_lengths: Optional sequence lengths for padding
-        
+          filler_list: (B, S) Long tensor of token ids
+          role_list_not_used: legacy arg (roles are learned)
         Returns:
-            output: Final representation (batch_size, final_layer_width)
-            role_predictions: Role assignment probabilities (seq_len, batch_size, n_roles)
+          output: (B, D_out)  encoded sequence
+          role_predictions: (S, B, n_roles)  for diagnostics / regularization
         """
-        # Get learned role embeddings from LSTM
-        # roles_embedded: (seq_len, batch_size, role_dim)
-        # role_predictions: (seq_len, batch_size, n_roles)
+        # 1) Filler embeddings (optionally squeezed)
+        fillers_embedded = self.filler_embedding(filler_list)  # (B, S, filler_dim or embedder_squeeze)
+        if self.embed_squeeze:
+            fillers_embedded = self.embedding_squeeze_layer(fillers_embedded)  # → (B, S, filler_dim)
+
+        # 2) Transformer role assignment (returns roles in (S, B, role_dim))
         roles_embedded, role_predictions = self.role_assigner(filler_list)
-        
-        # Get filler embeddings
-        # fillers_embedded: (batch_size, seq_len, filler_dim)
-        fillers_embedded = self.filler_embedding(filler_list)
-        
-        # Bind fillers and roles via tensor product
-        # output: (batch_size, filler_dim * role_dim)
+        # match binder's expected shape: we need roles_embedded as (B, S, role_dim)
+        roles_embedded = roles_embedded.transpose(0, 1)  # (B, S, role_dim)
+
+        # 3) Bind fillers × roles (TPR/HRR/Eltwise) and reduce across sequence
         output = self.sum_layer(fillers_embedded, roles_embedded)
-        
-        # Project to final dimensionality
-        # output: (batch_size, final_layer_width)
-        output = self.last_layer(output)
-        
-        return output, role_predictions
-    
-    def use_regularization(self, use_reg):
-        """Enable or disable regularization"""
-        self.regularize = use_reg
-    
-    def set_regularization_temp(self, temp):
-        """Set the temperature for regularization"""
+
+        # 4) Optional bottleneck to a specific dimensionality
+        if self.has_last:
+            output = self.last_layer(output)
+
+        return output, role_predictions  # role_predictions: (S, B, n_roles)
+
+    # ---- Regularization & mode toggles (kept unchanged) ----
+    def use_regularization(self, use_regularization: bool):
+        self.regularize = use_regularization
+
+    def set_regularization_temp(self, temp: float):
         self.regularization_temp = temp
-    
+
     def get_regularization_loss(self, role_predictions):
         """
-        Compute regularization losses to encourage discrete role assignments.
-        
-        Args:
-            role_predictions: (seq_len, batch_size, n_roles)
-        
-        Returns:
-            one_hot_loss: Encourages predictions to be close to one-hot
-            l2_loss: Encourages L2 norm constraints
-            unique_loss: Encourages different roles for different positions
+        Same regularizers as before, using role_predictions (S, B, R).
         """
         if not self.regularize:
             return 0, 0, 0
-        
-        temp = self.regularization_temp
+
+        one_hot_temperature = self.regularization_temp
         batch_size = role_predictions.shape[1]
-        
-        # Encourage one-hot vectors: w * (1 - w) should be small
-        # When w is 0 or 1, this term is 0
-        one_hot_reg = torch.sum(role_predictions * (1 - role_predictions))
-        one_hot_loss = temp * one_hot_reg / batch_size
-        
-        # Encourage proper L2 normalization
-        l2_norm = -torch.sum(role_predictions * role_predictions)
-        l2_norm_loss = temp * l2_norm / batch_size
-        
-        # Encourage unique role assignments across sequence
-        # Sum predictions across sequence: (batch_size, n_roles)
-        exclusive_role_vector = torch.sum(role_predictions, 0)
-        # This should also be close to one-hot (each role used once)
-        unique_role_loss = temp * torch.sum(
-            (exclusive_role_vector * (1 - exclusive_role_vector)) ** 2
-        ) / batch_size
-        
-        return (
-            self.one_hot_regularization_weight * one_hot_loss,
-            self.l2_norm_regularization_weight * l2_norm_loss,
-            self.unique_role_regularization_weight * unique_role_loss
-        )
-    
-    def get_role_assignments(self, filler_list):
-        """
-        Get role assignments without full forward pass.
-        Useful for analysis.
-        """
-        with torch.no_grad():
-            _, role_predictions = self.role_assigner(filler_list)
-            return role_predictions
-    
-    def train(self, mode=True):
-        """Override train to handle role prediction snapping"""
-        super().train(mode)
-        if mode:
-            # During training, use soft attention
-            self.role_assigner.snap_one_hot_predictions = False
+        softmax_roles = self.role_assigner.softmax_roles
+
+        if softmax_roles:
+            one_hot_reg = torch.sum(role_predictions * (1 - role_predictions))
         else:
-            # During evaluation, snap to discrete roles
-            self.role_assigner.snap_one_hot_predictions = True
-    
+            one_hot_reg = torch.sum((role_predictions ** 2) * (1 - role_predictions) ** 2)
+        one_hot_loss = one_hot_temperature * one_hot_reg / batch_size
+
+        if softmax_roles:
+            l2_norm = -torch.sum(role_predictions * role_predictions)
+        else:
+            l2_norm = (torch.sum(role_predictions ** 2) - 1) ** 2
+        l2_norm_loss = one_hot_temperature * l2_norm / batch_size
+
+        exclusive_role_vector = torch.sum(role_predictions, 0)
+        unique_role_loss = one_hot_temperature * torch.sum(
+            (exclusive_role_vector * (1 - exclusive_role_vector)) ** 2) / batch_size
+
+        return (self.one_hot_regularization_weight * one_hot_loss,
+                self.l2_norm_regularization_weight * l2_norm_loss,
+                self.unique_role_regularization_weight * unique_role_loss)
+
+    def train(self, mode: bool = True):
+        """
+        Toggle training mode; also ensure role assigner does NOT snap to one-hot.
+        """
+        super().train(mode)
+        self.role_assigner.snap_one_hot_predictions = False
+
     def eval(self):
-        """Override eval for consistency"""
-        self.train(False)
+        """
+        Eval mode; snap role predictions to one-hot if softmax_roles=True.
+        (Your Gumbel evaluation in role_approx.py overrides discretization anyway.)
+        """
+        super().eval()
+        self.role_assigner.snap_one_hot_predictions = True
+
+
+# (Optional) keep create_encoder_with_bert_embeddings unchanged, or wire it to use the transformer assigner.
