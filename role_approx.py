@@ -281,6 +281,7 @@ def train_epoch(model, train_batches, optimizer, criterion, batch_size, use_regu
                 total_loss += reg_loss
 
         total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         epoch_losses.append(recon_loss.item())
         if use_regularization:
@@ -325,6 +326,7 @@ def train_decoder(decoder, data, optimizer, criterion, batch_size, n_epochs=50, 
             logits = decoder(batch_enc, batch_tgt[:, :-1], teacher_forcing_ratio=1.0)
             loss = criterion(logits.reshape(-1, logits.size(-1)), batch_tgt[:, 1:].reshape(-1))
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(decoder.parameters(), 1.0)
             optimizer.step()
 
             epoch_loss += loss.item(); n_batches += 1
@@ -515,13 +517,13 @@ def main():
     BATCH_SIZE = 16
 
     # One-shot eval (non-annealed)
-    GUMBEL_TEMP = 0.5
+    GUMBEL_TEMP = 0.7
     RUN_HARD_ONESHOT = True
 
     # Annealing sweep (eval-only)
-    TEMP_INIT = 1.0
-    TEMP_MIN = 0.1
-    TEMP_DECAY = 0.95
+    TEMP_INIT = 1.5
+    TEMP_MIN = 0.05
+    TEMP_DECAY = 0.9
     RUN_SOFT_CURVE = True
     RUN_HARD_CURVE = True
 
@@ -564,27 +566,29 @@ def main():
 
     # 2) ROLE model (sizes should match your data)
     num_fillers = 101  # tokens 0..100 (adjust if needed)
-    n_roles = 32
-    filler_dim = 32
-    role_dim = 16
+    n_roles = 6
+    filler_dim = 64
+    role_dim = 32
 
     # FLATTENED encoding dim
     target_dim = int(data[0].target_rep.view(-1).numel())
 
     role_model = RoleLearningTensorProductEncoder(
-        n_roles=n_roles,
+        n_roles=6,
         n_fillers=num_fillers,
-        filler_dim=filler_dim,
-        role_dim=role_dim,
+        filler_dim=64,
+        role_dim=32,
         final_layer_width=target_dim,
         binder="tpr",
-        role_learner_hidden_dim=64,
-        bidirectional=False,
-        num_layers=1,
+        role_learner_hidden_dim=256,  # ← was 64
+        num_layers=4,  # keep 4 (good), or try 3–4
+        nhead=8,  # make sure it divides 256
+        dim_feedforward=1024,  # ~4× model dim
+        dropout=0.1,
         softmax_roles=True,
-        one_hot_regularization_weight=1.0,
+        one_hot_regularization_weight=2.0,
         l2_norm_regularization_weight=1.0,
-        unique_role_regularization_weight=1.0,
+        unique_role_regularization_weight=2.0,
     ).to(device)
 
     # 3) Train ROLE against TPDN encodings
@@ -612,13 +616,16 @@ def main():
         encoding_dim=target_dim,
         output_vocab_size=out_vocab,
         max_seq_len=max_seq_len,
-        d_model=128, nhead=4, num_layers=2, dim_feedforward=256, dropout=0.1,
+        d_model=256, nhead=8, num_layers=4, dim_feedforward=1024, dropout=0.1,
         sos_id=SOS_ID, eos_id=EOS_ID, pad_id=PAD_ID
     ).to(device)
 
-    dec_opt = optim.Adam(decoder.parameters(), lr=1e-3)
-    dec_crit = nn.CrossEntropyLoss(ignore_index=PAD_ID)
+    # NEW: tie output head to embedding for better calibration
+    decoder.output_proj.weight = decoder.output_embedding.weight
 
+    # NEW: label smoothing helps sequence-level accuracy
+    dec_crit = nn.CrossEntropyLoss(label_smoothing=0.1, ignore_index=PAD_ID)
+    dec_opt = torch.optim.AdamW(decoder.parameters(), lr=1e-3)
     # Train decoder (uses true TPDN encodings)
     decoder, _, _ = train_decoder(decoder, data, dec_opt, dec_crit, batch_size=BATCH_SIZE,
                                   n_epochs=EPOCHS_DEC, patience=10)
