@@ -330,7 +330,7 @@ class RoleLearningTensorProductEncoder(nn.Module):
         (Your Gumbel evaluation in role_approx.py overrides discretization anyway.)
         """
         super().eval()
-        self.role_assigner.snap_one_hot_predictions = True
+        self.role_assigner.snap_one_hot_predictions = False
 
 
 # (Optional) keep create_encoder_with_bert_embeddings unchanged, or wire it to use the transformer assigner.

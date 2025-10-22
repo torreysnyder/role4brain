@@ -281,7 +281,6 @@ def train_epoch(model, train_batches, optimizer, criterion, batch_size, use_regu
                 total_loss += reg_loss
 
         total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         epoch_losses.append(recon_loss.item())
         if use_regularization:
@@ -326,7 +325,6 @@ def train_decoder(decoder, data, optimizer, criterion, batch_size, n_epochs=50, 
             logits = decoder(batch_enc, batch_tgt[:, :-1], teacher_forcing_ratio=1.0)
             loss = criterion(logits.reshape(-1, logits.size(-1)), batch_tgt[:, 1:].reshape(-1))
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(decoder.parameters(), 1.0)
             optimizer.step()
 
             epoch_loss += loss.item(); n_batches += 1
@@ -517,13 +515,13 @@ def main():
     BATCH_SIZE = 16
 
     # One-shot eval (non-annealed)
-    GUMBEL_TEMP = 0.7
+    GUMBEL_TEMP = 0.5
     RUN_HARD_ONESHOT = True
 
     # Annealing sweep (eval-only)
-    TEMP_INIT = 1.5
-    TEMP_MIN = 0.05
-    TEMP_DECAY = 0.9
+    TEMP_INIT = 1.0
+    TEMP_MIN = 0.1
+    TEMP_DECAY = 0.95
     RUN_SOFT_CURVE = True
     RUN_HARD_CURVE = True
 
@@ -574,21 +572,19 @@ def main():
     target_dim = int(data[0].target_rep.view(-1).numel())
 
     role_model = RoleLearningTensorProductEncoder(
-        n_roles=6,
+        n_roles=n_roles,
         n_fillers=num_fillers,
-        filler_dim=64,
-        role_dim=32,
+        filler_dim=filler_dim,
+        role_dim=role_dim,
         final_layer_width=target_dim,
         binder="tpr",
-        role_learner_hidden_dim=256,  # ← was 64
-        num_layers=4,  # keep 4 (good), or try 3–4
-        nhead=8,  # make sure it divides 256
-        dim_feedforward=1024,  # ~4× model dim
-        dropout=0.1,
+        role_learner_hidden_dim=256,
+        bidirectional=False,
+        num_layers=4,
         softmax_roles=True,
-        one_hot_regularization_weight=2.0,
+        one_hot_regularization_weight=1.0,
         l2_norm_regularization_weight=1.0,
-        unique_role_regularization_weight=2.0,
+        unique_role_regularization_weight=1.0,
     ).to(device)
 
     # 3) Train ROLE against TPDN encodings
@@ -616,19 +612,43 @@ def main():
         encoding_dim=target_dim,
         output_vocab_size=out_vocab,
         max_seq_len=max_seq_len,
-        d_model=256, nhead=8, num_layers=4, dim_feedforward=1024, dropout=0.1,
+        d_model=128, nhead=4, num_layers=2, dim_feedforward=256, dropout=0.1,
         sos_id=SOS_ID, eos_id=EOS_ID, pad_id=PAD_ID
     ).to(device)
 
-    # NEW: tie output head to embedding for better calibration
-    decoder.output_proj.weight = decoder.output_embedding.weight
+    dec_opt = optim.Adam(decoder.parameters(), lr=1e-3)
+    dec_crit = nn.CrossEntropyLoss(ignore_index=PAD_ID)
 
-    # NEW: label smoothing helps sequence-level accuracy
-    dec_crit = nn.CrossEntropyLoss(label_smoothing=0.1, ignore_index=PAD_ID)
-    dec_opt = torch.optim.AdamW(decoder.parameters(), lr=1e-3)
     # Train decoder (uses true TPDN encodings)
-    decoder, _, _ = train_decoder(decoder, data, dec_opt, dec_crit, batch_size=BATCH_SIZE,
-                                  n_epochs=EPOCHS_DEC, patience=10)
+    decoder, train_losses, valid_losses = train_decoder(
+        decoder, data, dec_opt, dec_crit, batch_size=BATCH_SIZE, n_epochs=EPOCHS_DEC, patience=10
+    )
+
+    # ---- Save decoder loss curves (CSV + PNG) ----
+    # CSV
+    with open("decoder_losses.csv", "w", newline="") as f:
+        import csv
+        w = csv.writer(f)
+        w.writerow(["epoch", "train_loss", "valid_loss"])
+        for i, (tr, va) in enumerate(zip(train_losses, valid_losses), start=1):
+            w.writerow([i, tr, va])
+    print("Saved CSV: decoder_losses.csv")
+
+    # Plot
+    import matplotlib.pyplot as plt
+
+    epochs = list(range(1, len(train_losses) + 1))
+    plt.figure()
+    plt.plot(epochs, train_losses, marker="o", label="Train loss")
+    plt.plot(epochs, valid_losses, marker="o", label="Valid loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("Cross-entropy loss")
+    plt.title("Transformer decoder training")
+    plt.grid(True, linestyle="--", alpha=0.4)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("decoder_losses.png", dpi=150)
+    print("Saved plot: decoder_losses.png")
 
     # 5a) One-shot substitution accuracy at fixed T
     # Build test_set (same as above, but ensure non-empty)
