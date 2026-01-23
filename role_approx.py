@@ -4,6 +4,8 @@ ROLE approximation TPDN decoder evaluation with Gumbel-Softmax
 - Uses final projection layer of TPDN decoder to reconstruct original number sequences from ROLE-approximated TPDN encodings
 - Evaluates substitution accuracy by feeding ROLE's encodings to the TPDN decoder
 - Includes eval-only temperature annealing + CSV/PNG outputs
+- ADDED: Visualization of softmax role distributions
+
 """
 
 import sys
@@ -109,6 +111,24 @@ def load_tpdn_encodings(filename, device):
         sys.exit(1)
 
     print(f"Loaded {len(outputs)} instances")
+
+    # First pass: determine role offset
+    role_offset = 0
+    if outputs[0].get('role_ids') is not None:
+        all_role_ids = []
+        for entry in outputs:
+            if entry.get('role_ids') is not None:
+                all_role_ids.extend(entry['role_ids'])
+
+        if all_role_ids:
+            min_role = min(all_role_ids)
+            max_role = max(all_role_ids)
+            role_offset = min_role
+            print(f"\nRole indexing information:")
+            print(f"  Original role range: {min_role} to {max_role}")
+            print(f"  Will remap to: 0 to {max_role - min_role}")
+            print(f"  Role offset: {role_offset}")
+
     data = []
 
     for entry in outputs:
@@ -125,8 +145,12 @@ def load_tpdn_encodings(filename, device):
         # Use filler_ids as target output (the discrete tokens to reconstruct)
         target_seq_t = Variable(torch.LongTensor(filler_ids), requires_grad=False).unsqueeze(0)
 
-        role_t = Variable(torch.LongTensor(role_ids), requires_grad=False).unsqueeze(
-            0) if role_ids is not None else None
+        # FIXED: Remap roles to start at 0
+        if role_ids is not None:
+            remapped_role_ids = [r - role_offset for r in role_ids]
+            role_t = Variable(torch.LongTensor(remapped_role_ids), requires_grad=False).unsqueeze(0)
+        else:
+            role_t = None
 
         # Move to device
         filler_t = filler_t.to(device)
@@ -142,7 +166,7 @@ def load_tpdn_encodings(filename, device):
         print(f"  Sequence length: {len(outputs[0]['filler_ids'])}")
         print(f"  TPDN encoding dimension: {len(outputs[0]['tpdn_encoding'])}")
         print(f"  Role scheme: {outputs[0]['role_scheme']}")
-    return data
+    return data, role_offset
 
 
 # --------------------
@@ -190,6 +214,302 @@ def encode_with_gumbel(role_model, filler, temperature=1.0, hard=False):
         bound = bound.squeeze(0).view(1, -1)
 
     return bound
+
+
+# --------------------
+# NEW: Softmax Visualization Functions
+# --------------------
+
+@torch.no_grad()
+def get_softmax_distributions(role_model, data, num_samples=None):
+    """
+    Extract softmax role distributions from the ROLE model.
+
+    Returns:
+        softmax_probs: (num_samples, seq_len, n_roles) numpy array
+        predicted_roles: (num_samples, seq_len) numpy array of argmax roles
+        target_roles: (num_samples, seq_len) numpy array of ground truth roles (if available)
+        fillers: (num_samples, seq_len) numpy array of filler tokens
+    """
+    role_model.eval()
+
+    if num_samples is None:
+        num_samples = len(data)
+
+    samples_to_use = data[:num_samples]
+
+    all_softmax = []
+    all_pred_roles = []
+    all_true_roles = []
+    all_fillers = []
+
+    for inst in samples_to_use:
+        # Forward pass
+        _, role_logits = role_model(inst.filler, None)  # (S, B, R)
+
+        # Get softmax probabilities
+        role_probs = F.softmax(role_logits, dim=-1)  # (S, B, R)
+        role_probs = role_probs.squeeze(1).cpu().numpy()  # (S, R)
+
+        # Get predicted roles
+        pred_roles = role_probs.argmax(axis=-1)  # (S,)
+
+        # Get true roles if available
+        if inst.target_roles is not None:
+            true_roles = inst.target_roles.squeeze(0).cpu().numpy()  # (S,)
+        else:
+            true_roles = None
+
+        # Get fillers
+        fillers = inst.filler.squeeze(0).cpu().numpy()  # (S,)
+
+        all_softmax.append(role_probs)
+        all_pred_roles.append(pred_roles)
+        if true_roles is not None:
+            all_true_roles.append(true_roles)
+        all_fillers.append(fillers)
+
+    softmax_probs = np.array(all_softmax)  # (N, S, R)
+    predicted_roles = np.array(all_pred_roles)  # (N, S)
+    target_roles = np.array(all_true_roles) if all_true_roles else None  # (N, S) or None
+    fillers = np.array(all_fillers)  # (N, S)
+
+    return softmax_probs, predicted_roles, target_roles, fillers
+
+
+def plot_softmax_heatmaps(softmax_probs, predicted_roles, target_roles, fillers,
+                          num_examples=5, save_prefix="softmax_heatmap"):
+    """
+    Plot heatmaps of softmax distributions for individual sequences.
+
+    Args:
+        softmax_probs: (num_samples, seq_len, n_roles)
+        predicted_roles: (num_samples, seq_len)
+        target_roles: (num_samples, seq_len) or None
+        fillers: (num_samples, seq_len)
+        num_examples: number of sequences to plot
+        save_prefix: prefix for saved figure files
+    """
+    num_samples = min(num_examples, softmax_probs.shape[0])
+
+    for idx in range(num_samples):
+        probs = softmax_probs[idx]  # (S, R)
+        pred = predicted_roles[idx]  # (S,)
+        filler = fillers[idx]  # (S,)
+        true = target_roles[idx] if target_roles is not None else None  # (S,)
+
+        seq_len, n_roles = probs.shape
+
+        fig, ax = plt.subplots(figsize=(12, 6))
+
+        # Plot heatmap
+        im = ax.imshow(probs.T, aspect='auto', cmap='viridis', interpolation='nearest')
+
+        # Set ticks
+        ax.set_xticks(range(seq_len))
+        ax.set_yticks(range(n_roles))
+        ax.set_xlabel('Sequence Position', fontsize=12)
+        ax.set_ylabel('Role ID', fontsize=12)
+
+        # Add filler values as x-axis labels
+        ax.set_xticklabels([f'F{filler[i]}' for i in range(seq_len)])
+
+        # Add colorbar
+        plt.colorbar(im, ax=ax, label='Probability')
+
+        # Mark predicted roles with circles
+        for pos in range(seq_len):
+            ax.plot(pos, pred[pos], 'wo', markersize=8, markeredgewidth=2,
+                    markeredgecolor='red', fillstyle='none', label='Predicted' if pos == 0 else '')
+
+        # Mark true roles with X if available
+        if true is not None:
+            for pos in range(seq_len):
+                ax.plot(pos, true[pos], 'wx', markersize=10, markeredgewidth=2,
+                        label='Ground Truth' if pos == 0 else '')
+
+        # Add title with accuracy info
+        if true is not None:
+            accuracy = (pred == true).mean()
+            title = f'Softmax Role Distribution - Example {idx + 1}\nAccuracy: {accuracy:.2%}'
+        else:
+            title = f'Softmax Role Distribution - Example {idx + 1}'
+        ax.set_title(title, fontsize=14)
+
+        # Add legend
+        handles, labels = ax.get_legend_handles_labels()
+        by_label = dict(zip(labels, handles))
+        ax.legend(by_label.values(), by_label.keys(), loc='upper right')
+
+        plt.tight_layout()
+        plt.savefig(f'{save_prefix}_example_remap_{idx + 1}.png', dpi=200)
+        plt.close()
+        print(f"Saved {save_prefix}_example_remap_{idx + 1}.png")
+
+
+def plot_average_softmax_distribution(softmax_probs, predicted_roles, target_roles=None,
+                                      save_path="softmax_avg_distribution_remap.png"):
+    """
+    Plot the average softmax distribution across all sequences.
+
+    Args:
+        softmax_probs: (num_samples, seq_len, n_roles)
+        predicted_roles: (num_samples, seq_len)
+        target_roles: (num_samples, seq_len) or None
+        save_path: path to save figure
+    """
+    # Average across samples
+    avg_probs = softmax_probs.mean(axis=0)  # (S, R)
+
+    seq_len, n_roles = avg_probs.shape
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    # Plot heatmap
+    im = ax.imshow(avg_probs.T, aspect='auto', cmap='viridis', interpolation='nearest')
+
+    # Set ticks
+    ax.set_xticks(range(seq_len))
+    ax.set_yticks(range(n_roles))
+    ax.set_xlabel('Sequence Position', fontsize=12)
+    ax.set_ylabel('Role ID', fontsize=12)
+    ax.set_title('Average Softmax Role Distribution Across All Sequences', fontsize=14)
+
+    # Add colorbar
+    plt.colorbar(im, ax=ax, label='Average Probability')
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=200)
+    plt.close()
+    print(f"Saved {save_path}")
+
+
+def plot_entropy_analysis(softmax_probs, save_path="softmax_entropy_remap.png"):
+    """
+    Plot entropy of softmax distributions to analyze confidence.
+
+    Args:
+        softmax_probs: (num_samples, seq_len, n_roles)
+        save_path: path to save figure
+    """
+    # Compute entropy for each position in each sequence
+    # H = -sum(p * log(p))
+    eps = 1e-10
+    entropy = -np.sum(softmax_probs * np.log(softmax_probs + eps), axis=-1)  # (N, S)
+
+    # Average entropy per position
+    avg_entropy = entropy.mean(axis=0)  # (S,)
+    std_entropy = entropy.std(axis=0)  # (S,)
+
+    seq_len = len(avg_entropy)
+    positions = np.arange(seq_len)
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
+
+    # Plot 1: Average entropy per position
+    ax1.plot(positions, avg_entropy, marker='o', linewidth=2, markersize=6)
+    ax1.fill_between(positions, avg_entropy - std_entropy, avg_entropy + std_entropy,
+                     alpha=0.3, label='±1 std')
+    ax1.set_xlabel('Sequence Position', fontsize=12)
+    ax1.set_ylabel('Entropy (nats)', fontsize=12)
+    ax1.set_title('Average Softmax Entropy per Position', fontsize=14)
+    ax1.grid(True, alpha=0.3)
+    ax1.legend()
+
+    # Plot 2: Histogram of all entropies
+    ax2.hist(entropy.flatten(), bins=50, edgecolor='black', alpha=0.7)
+    ax2.set_xlabel('Entropy (nats)', fontsize=12)
+    ax2.set_ylabel('Frequency', fontsize=12)
+    ax2.set_title('Distribution of Softmax Entropies', fontsize=14)
+    ax2.axvline(entropy.mean(), color='red', linestyle='--', linewidth=2, label='Mean')
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=200)
+    plt.close()
+    print(f"Saved {save_path}")
+
+
+def plot_role_usage_distribution(predicted_roles, target_roles=None, n_roles=None,
+                                 save_path="role_usage_distribution_remap.png"):
+    """
+    Plot histogram of how often each role is used.
+
+    Args:
+        predicted_roles: (num_samples, seq_len)
+        target_roles: (num_samples, seq_len) or None
+        n_roles: total number of roles
+        save_path: path to save figure
+    """
+    if n_roles is None:
+        n_roles = int(predicted_roles.max()) + 1
+
+    # Count role usage
+    pred_counts = np.bincount(predicted_roles.flatten(), minlength=n_roles)
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    x = np.arange(n_roles)
+    width = 0.35
+
+    ax.bar(x - width / 2 if target_roles is not None else x, pred_counts, width,
+           label='Predicted', alpha=0.8)
+
+    if target_roles is not None:
+        true_counts = np.bincount(target_roles.flatten(), minlength=n_roles)
+        ax.bar(x + width / 2, true_counts, width, label='Ground Truth', alpha=0.8)
+
+    ax.set_xlabel('Role ID', fontsize=12)
+    ax.set_ylabel('Frequency', fontsize=12)
+    ax.set_title('Role Usage Distribution', fontsize=14)
+    ax.set_xticks(x)
+    ax.legend()
+    ax.grid(True, alpha=0.3, axis='y')
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=200)
+    plt.close()
+    print(f"Saved {save_path}")
+
+
+def visualize_softmax_outputs(role_model, data, n_roles, num_examples=5):
+    """
+    Main function to generate all softmax visualizations.
+
+    Args:
+        role_model: trained ROLE model
+        data: dataset to visualize
+        n_roles: number of roles
+        num_examples: number of individual examples to plot
+    """
+    print("\n" + "=" * 80)
+    print("GENERATING SOFTMAX VISUALIZATIONS")
+    print("=" * 80)
+
+    # Extract softmax distributions
+    softmax_probs, predicted_roles, target_roles, fillers = get_softmax_distributions(
+        role_model, data
+    )
+
+    print(f"Extracted softmax distributions:")
+    print(f"  Shape: {softmax_probs.shape}")
+    print(f"  Mean probability: {softmax_probs.mean():.4f}")
+    print(f"  Max probability: {softmax_probs.max():.4f}")
+
+    # Generate visualizations
+    plot_softmax_heatmaps(softmax_probs, predicted_roles, target_roles, fillers,
+                          num_examples=num_examples, save_prefix="softmax_heatmap")
+
+    plot_average_softmax_distribution(softmax_probs, predicted_roles, target_roles,
+                                      save_path="softmax_avg_distribution_remap.png")
+
+    plot_entropy_analysis(softmax_probs, save_path="softmax_entropy_remap.png")
+
+    plot_role_usage_distribution(predicted_roles, target_roles, n_roles=n_roles,
+                                 save_path="role_usage_distribution_remap.png")
+
+    print("Softmax visualization complete!")
 
 
 # --------------------
@@ -562,7 +882,7 @@ def plot_training_curves(role_train_mse, role_val_mse, role_val_acc,
     plt.grid(True, linestyle="--", alpha=0.5)
     plt.legend()
     plt.tight_layout()
-    plt.savefig("role_model_mse_encodings.png", dpi=200)
+    plt.savefig("role_model_mse_encodings_remap.png", dpi=200)
     plt.close()
 
     # ROLE Accuracy
@@ -574,10 +894,9 @@ def plot_training_curves(role_train_mse, role_val_mse, role_val_acc,
     plt.grid(True, linestyle="--", alpha=0.5)
     plt.legend()
     plt.tight_layout()
-    plt.savefig("role_model_acc_encodings.png", dpi=200)
+    plt.savefig("role_model_acc_encodings_remap.png", dpi=200)
     plt.close()
 
-    # ROLE Regularization losses
     # ROLE Regularization losses
     if role_train_one_hot is not None and role_train_unique is not None and role_train_l2 is not None:
         plt.figure()
@@ -600,7 +919,7 @@ def plot_training_curves(role_train_mse, role_val_mse, role_val_acc,
         plt.grid(True, linestyle="--", alpha=0.5)
         plt.legend()
         plt.tight_layout()
-        plt.savefig("role_model_reg_losses_encodings.png", dpi=200)
+        plt.savefig("role_model_reg_losses_encodings_remap.png", dpi=200)
         plt.close()
 
     # Decoder Loss
@@ -665,7 +984,7 @@ def compute_role_acc_aligned(pred_roles: np.ndarray, true_roles: np.ndarray, n_r
 
 def main():
     print("=" * 80)
-    print("ROLE APPROXIMATION WITH TPDN ENCODINGS")
+    print("ROLE APPROXIMATION WITH TPDN ENCODINGS (FIXED ROLE INDEXING)")
     print("=" * 80)
 
     # =========================
@@ -693,6 +1012,9 @@ def main():
     N_HEAD = 12
     DROPOUT = 0.0
 
+    # Visualization settings
+    NUM_SOFTMAX_EXAMPLES = 10  # Number of individual sequences to visualize
+
     # =========================
     # Setup
     # =========================
@@ -704,14 +1026,20 @@ def main():
     print("\n" + "=" * 80)
     print("LOADING DATA")
     print("=" * 80)
-    data = load_tpdn_encodings(TPDN_ENCODINGS_JSON, device)
+    data, role_offset = load_tpdn_encodings(TPDN_ENCODINGS_JSON, device)
 
     seq_len = data[0].filler.size(1)
     encoding_dim = data[0].target_encoding.view(-1).numel()
     num_fillers = max(int(inst.filler.max().item()) for inst in data) + 1
 
+    # FIXED: Compute n_roles based on remapped role range
     if data[0].target_roles is not None:
-        n_roles = int(max(inst.target_roles.max().item() for inst in data)) + 1
+        min_role = int(min(inst.target_roles.min().item() for inst in data))
+        max_role = int(max(inst.target_roles.max().item() for inst in data))
+        n_roles = max_role - min_role + 1
+        print(f"\nRole information after remapping:")
+        print(f"  Remapped role range: {min_role} to {max_role}")
+        print(f"  Number of unique roles: {n_roles}")
     else:
         n_roles = seq_len
 
@@ -813,7 +1141,7 @@ def main():
         if val_acc_aligned > best_role_acc:
             best_role_acc = val_acc_aligned
             torch.save(role_model.state_dict(), "best_role_model_encodings.pt")
-            print(" Saved best ROLE model")
+            print("  ✓ Saved best ROLE model")
 
     # Reload best ROLE model
     role_model.load_state_dict(torch.load("best_role_model_encodings.pt", map_location=device))
@@ -833,7 +1161,7 @@ def main():
 
     print(f"Decoder architecture:")
     print(f"  Input: encoding_dim = {encoding_dim}")
-    print(f"  Output: seq_len — num_fillers = {seq_len}— {num_fillers}")
+    print(f"  Output: seq_len × num_fillers = {seq_len}× {num_fillers}")
 
     print("\n" + "=" * 80)
     print("TRAINING SIMPLIFIED TPDN DECODER")
@@ -860,11 +1188,11 @@ def main():
         if val_acc > best_dec_acc:
             best_dec_acc = val_acc
             torch.save(decoder.state_dict(), "best_tpdn_decoder_encodings.pt")
-            print("  â†’ Saved best decoder")
+            print("  ✓ Saved best decoder")
 
     decoder.load_state_dict(torch.load("best_tpdn_decoder_encodings.pt", map_location=device))
 
-    # Plot training curves
+    # # Plot training curves
     plot_training_curves(
         role_train_mse_hist,
         role_val_mse_hist,
@@ -875,6 +1203,11 @@ def main():
         role_train_unique=role_train_unique_hist,
         role_train_l2=role_train_l2_hist,
     )
+
+    # =========================
+    # NEW: Visualize Softmax Outputs
+    # =========================
+    visualize_softmax_outputs(role_model, test_set, n_roles, num_examples=NUM_SOFTMAX_EXAMPLES)
 
     # =========================
     # Substitution accuracy + temp sweep
@@ -930,9 +1263,15 @@ def main():
     print(f"  ROLE Model:")
     print(f"    Best Val MSE: {min(role_val_mse_hist):.6f}")
     print(f"    Best Val Role Acc: {best_role_acc:.4f}")
-    print(f"  Simplified TPDN Decoder:")
-    print(f"    Best Val Acc: {best_dec_acc:.4f}")
-    print(f"  Substitution (T=1.0): soft={acc_soft:.4f} hard={acc_hard:.4f}")
+    # print(f"  Simplified TPDN Decoder:")
+    # print(f"    Best Val Acc: {best_dec_acc:.4f}")
+    # print(f"  Substitution (T=1.0): soft={acc_soft:.4f} hard={acc_hard:.4f}")
+    print(f"\nGenerated visualizations:")
+    print(f"  - Softmax heatmaps for {NUM_SOFTMAX_EXAMPLES} examples")
+    print(f"  - Average softmax distribution")
+    print(f"  - Entropy analysis")
+    print(f"  - Role usage distribution")
+    print(f"\nRole offset applied: {role_offset}")
 
 
 if __name__ == "__main__":
