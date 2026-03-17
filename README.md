@@ -70,13 +70,13 @@ The TPDN encodings used to train the ROLE model were generated using a toy datas
 Data is split 80/20 into training and test sets. Validation is run every 5 epochs (plus the first and final epoch).
 
 ### Checkpoint Selection
-
+ 
 Model checkpoints are selected using a **combined score** that balances reconstruction quality and role assignment accuracy:
-
-$$\text{score} = \text{val\_MSE} + \lambda_\text{acc} \cdot (1 - \text{acc\_aligned})$$
-
-with $\lambda_\text{acc} = 10.0$. Once aligned role accuracy reaches 99%, the selection criterion switches to pure validation MSE, allowing continued optimisation of encoding quality after role assignments have effectively converged.
-
+ 
+$$\text{score} = \text{val MSE} + \lambda_{\text{acc}} \cdot (1 - \text{acc aligned})$$
+ 
+with $\lambda_{\text{acc}} = 10.0$. Once aligned role accuracy reaches 99%, the selection criterion switches to pure validation MSE, allowing continued optimisation of encoding quality after role assignments have effectively converged.
+ 
 Role assignment accuracy is computed using the **Hungarian algorithm** to find the optimal alignment between predicted and ground-truth role labels, accounting for arbitrary label permutations in the learned role space.
 
 ---
