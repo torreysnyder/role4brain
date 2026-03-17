@@ -107,5 +107,5 @@ Substitution accuracy measures how well the ROLE model's encodings can be decode
 
 ## References
 
-- Soulos, P., McCoy, R. T., Linzen, T., & Frank, R. (2020). [Discovering the Compositional Structure of Vector Representations with Role Learning Networks](https://aclanthology.org/2020.blackboxnlp-1.24/). *Proceedings of the Third BlackboxNLP Workshop on Analyzing and Interpreting Neural Networks for NLP.*
-- McCoy, R. T., Linzen, T., Dunbar, E., & Smolensky, P. (2019). [RNNs implicitly implement tensor product representations](https://arxiv.org/abs/1812.08718). *Proceedings of ICLR 2019.*
+- Soulos, P., McCoy, R. T., Linzen, T., & Frank, R. (2020). [Discovering the Compositional Structure of Vector Representations with Role Learning Networks](https://aclanthology.org/2020.blackboxnlp-1.23.pdf). *Proceedings of the Third BlackboxNLP Workshop on Analyzing and Interpreting Neural Networks for NLP.*
+- McCoy, R. T., Linzen, T., Dunbar, E., & Smolensky, P. (2019). [RNNs implicitly implement tensor product representations](https://hal.science/hal-02274498/). *Proceedings of ICLR 2019.*
