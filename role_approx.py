@@ -3,6 +3,13 @@
 - Uses final projection layer of TPDN decoder to reconstruct original number sequences from ROLE-approximated TPDN encodings
 - Evaluates substitution accuracy by feeding ROLE's encodings to the TPDN decoder
 - Includes eval-only temperature annealing + CSV/PNG outputs
+- MODIFICATIONS:
+  * Temperature annealing during training
+  * Entropy regularization
+  * Plot average softmax role assignments every 5 epochs
+  * Save all best ROLE models as best_role_model_encodings_{index}.pt
+  * Evaluate substitution accuracy for each checkpoint
+  * Modified evaluate_across_temps to use exactly 10 temperature points
 
 """
 
@@ -38,6 +45,23 @@ def set_seed(seed):
         torch.backends.cudnn.deterministic = True
     device = torch.device("cuda" if use_cuda else "cpu")
     return device
+
+
+def get_temperature(epoch, max_epochs, T_start=5.0, T_end=0.5):
+    """Anneal temperature from T_start to T_end over training"""
+    progress = epoch / max_epochs
+    return T_start * (T_end / T_start) ** progress
+
+
+def entropy_loss(role_probs):
+    """Encourage low-entropy (confident) role assignments
+
+    Args:
+        role_probs: (seq_len, batch, n_roles) or (batch, seq_len, n_roles)
+    """
+    # Add small epsilon for numerical stability
+    entropy = -(role_probs * torch.log(role_probs + 1e-10)).sum(dim=-1)
+    return entropy.mean()
 
 
 class RoleLearningInstance(object):
@@ -211,6 +235,36 @@ def encode_with_gumbel(role_model, filler, temperature=1.0, hard=False):
         bound = bound.squeeze(0).view(1, -1)
 
     return bound
+
+
+@torch.no_grad()
+def get_average_role_assignments(role_model, data, temperature=1.0):
+    """Get average softmax role assignment probabilities across dataset
+
+    Returns:
+        avg_probs: (seq_len, n_roles) - average probability of each role at each position
+    """
+    role_model.eval()
+
+    all_probs = []
+    for inst in data:
+        # Get role logits
+        _, role_logits = role_model(inst.filler, None)  # (S, B, R)
+
+        # Apply temperature and softmax
+        role_probs = F.softmax(role_logits / temperature, dim=-1)  # (S, B, R)
+
+        # Remove batch dimension and collect
+        role_probs = role_probs.squeeze(1)  # (S, R)
+        all_probs.append(role_probs.cpu())
+
+    # Average across all instances
+    all_probs = torch.stack(all_probs, dim=0)  # (N, S, R)
+    avg_probs = all_probs.mean(dim=0)  # (S, R)
+
+    return avg_probs.numpy()
+
+
 # --------------------
 # Training helpers
 # --------------------
@@ -245,6 +299,8 @@ def batchify_with_roles(data, batch_size):
 def train_epoch_role(
         model, train_batches, optimizer, criterion,
         use_regularization=True,
+        temperature=1.0,
+        entropy_weight=0.01,
         mu=None, sigma=None
 ):
     """Train ROLE for one epoch to match TPDN encodings."""
@@ -257,9 +313,10 @@ def train_epoch_role(
     total_one_hot = 0.0
     total_l2 = 0.0
     total_unique = 0.0
+    total_entropy = 0.0
     num_updates = 0
 
-    for batch in tqdm(train_batches, desc="Training ROLE"):
+    for batch in tqdm(train_batches, desc=f"Training ROLE (T={temperature:.2f})"):
         fillers = []
         targets = []
 
@@ -273,7 +330,7 @@ def train_epoch_role(
         optimizer.zero_grad()
 
         # Forward - get TPDN encoding from ROLE (without final projection)
-        pred, role_predictions = model(filler_batch, None)
+        pred, role_predictions = model(filler_batch, None, temperature=temperature)
 
         # Flatten predictions and targets
         pred_flat = pred.view(pred.size(0), -1)
@@ -298,6 +355,14 @@ def train_epoch_role(
             total_l2 += float(l2_loss.item())
             total_unique += float(unique_loss.item())
 
+        # Entropy regularization
+        if entropy_weight > 0:
+            # Get role probabilities
+            role_probs = F.softmax(role_predictions / temperature, dim=-1)
+            ent_loss = entropy_weight * entropy_loss(role_probs)
+            loss = loss + ent_loss
+            total_entropy += float(ent_loss.item())
+
         # Backward
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
@@ -314,17 +379,18 @@ def train_epoch_role(
         total_one_hot / denom,
         total_unique / denom,
         total_l2 / denom,
+        total_entropy / denom,
     )
 
 
 @torch.no_grad()
-def evaluate_role(role_model, data, mu=None, sigma=None):
+def evaluate_role(role_model, data, temperature=1.0, mu=None, sigma=None):
     """Evaluate ROLE MSE on dataset."""
     role_model.eval()
     total_mse = 0.0
 
     for inst in data:
-        pred, _ = role_model(inst.filler, None)
+        pred, _ = role_model(inst.filler, None, temperature=temperature)
 
         pred = pred.view(pred.size(0), -1)
         targ = inst.target_encoding.view(inst.target_encoding.size(0), -1)
@@ -340,7 +406,7 @@ def evaluate_role(role_model, data, mu=None, sigma=None):
 
 
 @torch.no_grad()
-def evaluate_role_accuracy(role_model, data, n_roles=None):
+def evaluate_role_accuracy(role_model, data, n_roles=None, temperature=1.0):
     """Evaluate role prediction accuracy."""
     role_model.eval()
 
@@ -351,7 +417,7 @@ def evaluate_role_accuracy(role_model, data, n_roles=None):
         if inst.target_roles is None:
             continue
 
-        _, role_logits = role_model(inst.filler, None)
+        _, role_logits = role_model(inst.filler, None, temperature=temperature)
 
         pred_roles = None
         if hasattr(role_model, "role_assigner") and hasattr(role_model.role_assigner, "last_role_probs"):
@@ -483,7 +549,7 @@ def evaluate_substitution_accuracy(role_model, decoder, data,
     correct = 0
     total = 0
 
-    for inst in tqdm(data, desc=f"Eval (T={gumbel_temp:.3f}, hard={use_hard_gumbel})"):
+    for inst in tqdm(data, desc=f"Eval (T={gumbel_temp:.3f}, hard={use_hard_gumbel})", leave=False):
         # Get ROLE encoding (raw, without final projection)
         role_enc = encode_with_gumbel(role_model, inst.filler,
                                       temperature=gumbel_temp, hard=use_hard_gumbel)
@@ -504,21 +570,12 @@ def evaluate_substitution_accuracy(role_model, decoder, data,
 
 
 @torch.no_grad()
-def evaluate_across_temps(role_model, decoder, data, temps=None, T_init=1.0, T_min=0.1, decay=0.95,
-                          csv_path="sub_acc_vs_T.csv", png_path="sub_acc_vs_T.png",
+def evaluate_across_temps(role_model, decoder, data, num_temps=10, T_init=1.0, T_min=0.1,
+                          csv_path="sub_acc_vs_T.csv", png_path="sub_acc_vs_T_additional.png",
                           mu=None, sigma=None):
-    """Evaluate substitution accuracy across temperature range."""
-    if temps is None:
-        temps = []
-        T = float(T_init)
-        while True:
-            temps.append(T)
-            if T <= T_min + 1e-12:
-                break
-            T_next = max(T_min, T * decay) if decay < 1.0 else T_min
-            if abs(T_next - T) < 1e-12:
-                break
-            T = T_next
+    """Evaluate substitution accuracy across temperature range with exactly num_temps points."""
+    # Generate exactly num_temps temperature points logarithmically spaced
+    temps = np.logspace(np.log10(T_init), np.log10(T_min), num_temps).tolist()
 
     rows = []
     results = {"soft": [], "hard": []}
@@ -555,6 +612,7 @@ def evaluate_across_temps(role_model, decoder, data, temps=None, T_init=1.0, T_m
     plt.legend()
     plt.tight_layout()
     plt.savefig(png_path, dpi=150)
+    plt.close()
     print(f"Saved plot: {png_path}")
 
     return temps, results
@@ -564,9 +622,30 @@ def evaluate_across_temps(role_model, decoder, data, temps=None, T_init=1.0, T_m
 # Plotting
 # --------------------
 
+def plot_role_assignments(avg_probs, epoch, save_path):
+    """Plot heatmap of average role assignments per position
+
+    Args:
+        avg_probs: (seq_len, n_roles) numpy array
+        epoch: current epoch number
+        save_path: path to save the plot
+    """
+    plt.figure(figsize=(10, 6))
+    plt.imshow(avg_probs.T, aspect='auto', cmap='viridis', interpolation='nearest')
+    plt.colorbar(label='Average Probability')
+    plt.xlabel('Sequence Position')
+    plt.ylabel('Role ID')
+    plt.title(f'Average Softmax Role Assignments (Epoch {epoch})')
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150)
+    plt.close()
+    print(f"  Saved role assignment plot: {save_path}")
+
+
 def plot_training_curves(role_train_mse, role_val_mse, role_val_acc,
                          dec_train_loss, dec_val_acc,
-                         role_train_one_hot=None, role_train_unique=None, role_train_l2=None):
+                         role_train_one_hot=None, role_train_unique=None,
+                         role_train_l2=None, role_train_entropy=None):
     """Plot training curves."""
     epochs_role = np.arange(1, len(role_train_mse) + 1)
     epochs_dec = np.arange(1, len(dec_train_loss) + 1)
@@ -581,7 +660,7 @@ def plot_training_curves(role_train_mse, role_val_mse, role_val_acc,
     plt.grid(True, linestyle="--", alpha=0.5)
     plt.legend()
     plt.tight_layout()
-    plt.savefig("role_model_mse_encodings_remap.png", dpi=200)
+    plt.savefig("role_model_mse_encodings_additional_epochs.png", dpi=200)
     plt.close()
 
     # ROLE Accuracy
@@ -593,7 +672,7 @@ def plot_training_curves(role_train_mse, role_val_mse, role_val_acc,
     plt.grid(True, linestyle="--", alpha=0.5)
     plt.legend()
     plt.tight_layout()
-    plt.savefig("role_model_acc_encodings_remap.png", dpi=200)
+    plt.savefig("role_model_acc_encodings_additional_epochs.png", dpi=200)
     plt.close()
 
     # ROLE Regularization losses
@@ -609,6 +688,10 @@ def plot_training_curves(role_train_mse, role_val_mse, role_val_acc,
         plt.plot(epochs_role, unique + eps, marker="s", label="Unique-role reg")
         plt.plot(epochs_role, l2 + eps, marker="^", label="L2 reg")
 
+        if role_train_entropy is not None:
+            entropy = np.array(role_train_entropy, dtype=float)
+            plt.plot(epochs_role, entropy + eps, marker="d", label="Entropy reg")
+
         # Key change: make small values visible even with big spikes
         plt.yscale("symlog", linthresh=1e-6)
 
@@ -618,7 +701,7 @@ def plot_training_curves(role_train_mse, role_val_mse, role_val_acc,
         plt.grid(True, linestyle="--", alpha=0.5)
         plt.legend()
         plt.tight_layout()
-        plt.savefig("role_model_reg_losses_encodings_remap.png", dpi=200)
+        plt.savefig("role_model_reg_losses_encodings_additional_epochs.png", dpi=200)
         plt.close()
 
     # Decoder Loss
@@ -648,33 +731,28 @@ def plot_training_curves(role_train_mse, role_val_mse, role_val_acc,
 
 def _hungarian_best_map(conf_mat: np.ndarray) -> np.ndarray:
     """conf_mat[pred, true] = count. Returns mapping array map_pred_to_true[pred] = true"""
-    try:
-        from scipy.optimize import linear_sum_assignment
-        row_ind, col_ind = linear_sum_assignment(-conf_mat)
-        mapping = np.full(conf_mat.shape[0], -1, dtype=int)
-        mapping[row_ind] = col_ind
-        return mapping
-    except Exception:
-        mapping = np.full(conf_mat.shape[0], -1, dtype=int)
-        used_true = set()
-        for pred in np.argsort(-conf_mat.max(axis=1)):
-            true = int(np.argmax(conf_mat[pred]))
-            while true in used_true:
-                conf_mat[pred, true] = -1
-                true = int(np.argmax(conf_mat[pred]))
-            mapping[pred] = true
-            used_true.add(true)
-        return mapping
+    from scipy.optimize import linear_sum_assignment
+    cost = -conf_mat
+    pred_idx, true_idx = linear_sum_assignment(cost)
+    mapping = np.zeros(conf_mat.shape[0], dtype=int)
+    mapping[pred_idx] = true_idx
+    return mapping
 
 
-def compute_role_acc_aligned(pred_roles: np.ndarray, true_roles: np.ndarray, n_roles: int) -> float:
-    """pred_roles, true_roles: shape (N, S) integer role ids"""
-    conf = np.zeros((n_roles, n_roles), dtype=np.int64)
-    for p, t in zip(pred_roles.reshape(-1), true_roles.reshape(-1)):
-        conf[int(p), int(t)] += 1
-    mapping = _hungarian_best_map(conf.copy())
-    mapped_pred = mapping[pred_roles]
-    return float((mapped_pred == true_roles).mean())
+def compute_role_acc_aligned(pred: np.ndarray, true: np.ndarray, n_roles: int) -> float:
+    """
+    pred, true: shape (N, S)
+    Returns accuracy after optimal label alignment via Hungarian algorithm
+    """
+    conf = np.zeros((n_roles, n_roles), dtype=int)
+    for p_row, t_row in zip(pred, true):
+        for p, t in zip(p_row, t_row):
+            conf[p, t] += 1
+
+    mapping = _hungarian_best_map(conf)
+    pred_aligned = mapping[pred]
+    acc = float((pred_aligned == true).mean())
+    return acc
 
 
 # --------------------
@@ -683,7 +761,7 @@ def compute_role_acc_aligned(pred_roles: np.ndarray, true_roles: np.ndarray, n_r
 
 def main():
     print("=" * 80)
-    print("ROLE APPROXIMATION WITH TPDN ENCODINGS (FIXED ROLE INDEXING)")
+    print("ROLE APPROXIMATION WITH TPDN ENCODINGS (TRAIN FROM SCRATCH + COMBINED CHECKPOINT SCORE)")
     print("=" * 80)
 
     # =========================
@@ -692,12 +770,28 @@ def main():
     TPDN_ENCODINGS_JSON = "tpdn_encodings_test_l2r.json"
     SEED = 42
 
-    # ROLE training
-    EPOCHS_ROLE = 30
+    # ROLE training (from scratch)
+    TOTAL_ROLE_EPOCHS = 100
     BATCH_SIZE = 16
     ROLE_LR = 1e-3
     USE_ROLE_REG = True
-    STANDARDIZE = True  # Whether to standardize encodings
+    STANDARDIZE = True
+
+    # Runtime: validate less frequently
+    EVAL_INTERVAL = 5  # validate every N epochs (plus first eval epoch and last)
+
+    # Temperature annealing (use TOTAL epochs for a smooth schedule across resume)
+    T_START = 5.0
+    T_END = 0.5
+
+    # Entropy regularization
+    ENTROPY_WEIGHT = 0.01
+
+    # Option A: combined checkpoint selection
+    # score = val_mse + lambda * (1 - val_acc_aligned), but once acc >= MIN_ACC_TO_TRACK_MSE,
+    # we switch to pure val_mse to keep saving lower-MSE models after acc saturates.
+    LAMBDA_ACC = 10.0
+    MIN_ACC_TO_TRACK_MSE = 0.99
 
     # Decoder training
     EPOCHS_DEC = 30
@@ -710,8 +804,6 @@ def main():
     NUM_LAYERS = 6
     N_HEAD = 12
     DROPOUT = 0.0
-
-    # Visualization settings
 
     # =========================
     # Setup
@@ -730,7 +822,7 @@ def main():
     encoding_dim = data[0].target_encoding.view(-1).numel()
     num_fillers = max(int(inst.filler.max().item()) for inst in data) + 1
 
-    # FIXED: Compute n_roles based on remapped role range
+    # Compute n_roles based on remapped role range
     if data[0].target_roles is not None:
         min_role = int(min(inst.target_roles.min().item() for inst in data))
         max_role = int(max(inst.target_roles.max().item() for inst in data))
@@ -768,7 +860,6 @@ def main():
     print("CREATING ROLE MODEL")
     print("=" * 80)
 
-    # ROLE model outputs raw TPDN encodings (no final projection)
     role_model = RoleLearningTensorProductEncoder(
         n_roles=n_roles,
         n_fillers=num_fillers,
@@ -785,12 +876,23 @@ def main():
     ).to(device)
     role_model.use_regularization(USE_ROLE_REG)
 
-    print(f"ROLE model architecture:")
-    print(f"  Binder output dimension: {role_model.binder_output_dim}")
-    print(f"  Expected to match encoding_dim: {encoding_dim}")
+    # =========================
+    # Training from scratch setup
+    # =========================
+    start_epoch_0idx = 0
+    total_role_epochs = TOTAL_ROLE_EPOCHS
+    print(f"\nROLE training plan:")
+    print(f"  Training from scratch for {total_role_epochs} epochs")
+    print(f"  Temperature annealing: {T_START} → {T_END}")
+    print(f"  Entropy regularization weight: {ENTROPY_WEIGHT}")
+    print(f"  Validation interval: every {EVAL_INTERVAL} epochs")
+    print(f"  Checkpoint selection: combined score (Option A)")
+    print(f"    score = val_mse + {LAMBDA_ACC}*(1-acc_aligned) until acc_aligned >= {MIN_ACC_TO_TRACK_MSE}, then score=val_mse")
+    print(f"  NOTE: role assignment plots disabled")
+    print(f"  NOTE: substitution accuracy evaluated ONCE using best ROLE model only")
 
     # =========================
-    # Train ROLE
+    # Train ROLE (resume)
     # =========================
     print("\n" + "=" * 80)
     print("TRAINING ROLE MODEL")
@@ -799,50 +901,98 @@ def main():
     role_optimizer = optim.Adam(role_model.parameters(), lr=ROLE_LR)
     role_criterion = nn.MSELoss()
 
+    # Histories (only for the new/resumed segment)
     role_train_mse_hist = []
     role_train_one_hot_hist = []
     role_train_unique_hist = []
     role_train_l2_hist = []
+    role_train_entropy_hist = []
     role_val_mse_hist = []
     role_val_acc_hist = []
     role_val_acc_aligned_hist = []
-    best_role_acc = 0.0
 
-    for epoch in range(EPOCHS_ROLE):
-        _, avg_mse, avg_one_hot, avg_unique, avg_l2 = train_epoch_role(
+    best_role_path = "best_role_model_encodings.pt"
+    best_score = float("inf")
+    best_role_epoch_1idx = None
+    best_role_acc = -1.0
+    best_role_mse = float("inf")
+
+    for epoch_0idx in range(start_epoch_0idx, total_role_epochs):
+        temperature = get_temperature(epoch_0idx, total_role_epochs, T_START, T_END)
+
+        _, avg_mse, avg_one_hot, avg_unique, avg_l2, avg_entropy = train_epoch_role(
             role_model,
             train_batches,
             role_optimizer,
             role_criterion,
             use_regularization=USE_ROLE_REG,
+            temperature=temperature,
+            entropy_weight=ENTROPY_WEIGHT,
             mu=enc_mu,
             sigma=enc_sigma
         )
-
-        val_mse = evaluate_role(role_model, test_set, mu=enc_mu, sigma=enc_sigma)
-        val_acc_raw, val_acc_aligned = evaluate_role_accuracy(role_model, test_set, n_roles=n_roles)
 
         role_train_mse_hist.append(avg_mse)
         role_train_one_hot_hist.append(avg_one_hot)
         role_train_unique_hist.append(avg_unique)
         role_train_l2_hist.append(avg_l2)
-        role_val_mse_hist.append(val_mse)
-        role_val_acc_hist.append(val_acc_raw)
-        role_val_acc_aligned_hist.append(val_acc_aligned)
+        role_train_entropy_hist.append(avg_entropy)
 
-        print(
-            f"Epoch {epoch + 1}/{EPOCHS_ROLE}: "
-            f"Train MSE={avg_mse:.6f}, Val MSE={val_mse:.6f}, "
-            f"Val Role Acc(raw)={val_acc_raw:.4f}, Val Role Acc(aligned)={val_acc_aligned:.4f}"
-        )
+        # Evaluate less frequently
+        epoch_1idx = epoch_0idx + 1
+        do_eval = (epoch_1idx == (start_epoch_0idx + 1)) or (epoch_1idx == total_role_epochs) or (epoch_1idx % EVAL_INTERVAL == 0)
 
-        if val_acc_aligned > best_role_acc:
-            best_role_acc = val_acc_aligned
-            torch.save(role_model.state_dict(), "best_role_model_encodings.pt")
-            print("  ✓ Saved best ROLE model")
+        if do_eval:
+            val_mse = evaluate_role(role_model, test_set, temperature=temperature, mu=enc_mu, sigma=enc_sigma)
+            val_acc_raw, val_acc_aligned = evaluate_role_accuracy(
+                role_model, test_set, n_roles=n_roles, temperature=temperature
+            )
 
-    # Reload best ROLE model
-    role_model.load_state_dict(torch.load("best_role_model_encodings.pt", map_location=device))
+            # Option A combined score
+            score = val_mse + LAMBDA_ACC * (1.0 - val_acc_aligned)
+            if val_acc_aligned >= MIN_ACC_TO_TRACK_MSE:
+                score = val_mse  # once roles are basically correct, optimize MSE only
+
+            if score < best_score:
+                best_score = float(score)
+                best_role_epoch_1idx = epoch_1idx
+                best_role_acc = float(val_acc_aligned)
+                best_role_mse = float(val_mse)
+                torch.save(role_model.state_dict(), best_role_path)
+                print(
+                    f"  ✓ Saved best ROLE model: {best_role_path} "
+                    f"(epoch={best_role_epoch_1idx}, score={best_score:.6f}, mse={best_role_mse:.6f}, acc_aligned={best_role_acc:.4f})"
+                )
+
+            print(
+                f"Epoch {epoch_1idx}/{total_role_epochs} (T={temperature:.3f}): "
+                f"Train MSE={avg_mse:.6f}, Val MSE={val_mse:.6f}, "
+                f"Val Role Acc(raw)={val_acc_raw:.4f}, Val Role Acc(aligned)={val_acc_aligned:.4f}, "
+                f"Entropy={avg_entropy:.6f}, Score={float(score):.6f}"
+            )
+
+            role_val_mse_hist.append(val_mse)
+            role_val_acc_hist.append(val_acc_raw)
+            role_val_acc_aligned_hist.append(val_acc_aligned)
+        else:
+            print(
+                f"Epoch {epoch_1idx}/{total_role_epochs} (T={temperature:.3f}): "
+                f"Train MSE={avg_mse:.6f}, (skipping val; interval={EVAL_INTERVAL}) "
+                f"Entropy={avg_entropy:.6f}"
+            )
+            # keep arrays aligned for plotting
+            role_val_mse_hist.append(float("nan"))
+            role_val_acc_hist.append(float("nan"))
+            role_val_acc_aligned_hist.append(float("nan"))
+
+    # Load best ROLE model before decoder training / substitution eval
+    try:
+        role_model.load_state_dict(torch.load(best_role_path, map_location=device))
+        print(f"\nLoaded best ROLE model from {best_role_path}")
+        if best_role_epoch_1idx is not None:
+            print(f"  Best epoch: {best_role_epoch_1idx} | mse={best_role_mse:.6f} | acc_aligned={best_role_acc:.4f} | score={best_score:.6f}")
+    except FileNotFoundError:
+        print(f"\nWARNING: Best ROLE checkpoint not found at {best_role_path}. Using current in-memory model.")
 
     # =========================
     # Create + Train Simplified TPDN Decoder
@@ -890,7 +1040,7 @@ def main():
 
     decoder.load_state_dict(torch.load("best_tpdn_decoder_encodings.pt", map_location=device))
 
-    # # Plot training curves
+    # Plot training curves (no role assignment heatmaps)
     plot_training_curves(
         role_train_mse_hist,
         role_val_mse_hist,
@@ -900,16 +1050,21 @@ def main():
         role_train_one_hot=role_train_one_hot_hist,
         role_train_unique=role_train_unique_hist,
         role_train_l2=role_train_l2_hist,
+        role_train_entropy=role_train_entropy_hist,
     )
 
     # =========================
-
-    # =========================
-    # Substitution accuracy + temp sweep
+    # Substitution accuracy: evaluate ONCE using best ROLE model only
     # =========================
     print("\n" + "=" * 80)
-    print("SUBSTITUTION ACCURACY EVALUATION")
+    print("EVALUATING SUBSTITUTION ACCURACY (BEST ROLE MODEL ONLY)")
     print("=" * 80)
+
+    # Ensure best ROLE is loaded
+    try:
+        role_model.load_state_dict(torch.load(best_role_path, map_location=device))
+    except FileNotFoundError:
+        pass
 
     acc_soft = evaluate_substitution_accuracy(
         role_model,
@@ -930,40 +1085,25 @@ def main():
         sigma=enc_sigma,
     )
 
-    print(f"\nSubstitution accuracy at T=1.0:")
+    print(f"\nSubstitution accuracy at T=1.0 (best ROLE only):")
     print(f"  Soft Gumbel: {acc_soft:.4f}")
     print(f"  Hard Gumbel: {acc_hard:.4f}")
-
-    print("\n" + "=" * 80)
-    print("TEMPERATURE SWEEP")
-    print("=" * 80)
-
-    evaluate_across_temps(
-        role_model,
-        decoder,
-        test_set,
-        T_init=1.0,
-        T_min=0.1,
-        decay=0.95,
-        csv_path="sub_acc_vs_T_encodings.csv",
-        png_path="plots/sub_acc_vs_T_encodings.png",
-        mu=enc_mu,
-        sigma=enc_sigma,
-    )
 
     print("\n" + "=" * 80)
     print("TRAINING COMPLETE!")
     print("=" * 80)
     print(f"\nFinal Results:")
     print(f"  ROLE Model:")
-    print(f"    Best Val MSE: {min(role_val_mse_hist):.6f}")
-    print(f"    Best Val Role Acc: {best_role_acc:.4f}")
-    # print(f"  Simplified TPDN Decoder:")
-    # print(f"    Best Val Acc: {best_dec_acc:.4f}")
-    # print(f"  Substitution (T=1.0): soft={acc_soft:.4f} hard={acc_hard:.4f}")
-    print(f"\nGenerated visualizations:")
-    print(f"  - Entropy analysis")
-    print(f"  - Role usage distribution")
+    if best_role_epoch_1idx is not None:
+        print(f"    Best epoch (by score): {best_role_epoch_1idx}")
+        print(f"    Best val MSE: {best_role_mse:.6f}")
+        print(f"    Best val aligned acc: {best_role_acc:.4f}")
+        print(f"    Best score: {best_score:.6f}")
+    else:
+        print(f"    Best checkpoint info: N/A")
+    print(f"  Simplified TPDN Decoder:")
+    print(f"    Best Val Acc: {best_dec_acc:.4f}")
+    print(f"  Substitution Acc (best ROLE, T=1.0): soft={acc_soft:.4f}, hard={acc_hard:.4f}")
     print(f"\nRole offset applied: {role_offset}")
 
 
