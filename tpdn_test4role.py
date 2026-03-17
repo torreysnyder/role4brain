@@ -157,10 +157,30 @@ class SumFlattenedOuterProduct(nn.Module):
         super(SumFlattenedOuterProduct, self).__init__()
 
     def forward(self, input1, input2):
-        # Compute outer product and flatten
-        outer_product = torch.bmm(input1.transpose(1, 2), input2)
-        flattened_outer_product = outer_product.view(outer_product.size()[0], -1).unsqueeze(0)
-        return flattened_outer_product
+        # input1, input2: (S, B, D) - sequence first format
+        # We need to compute outer product at each position, then SUM over sequence
+
+        S, B, D1 = input1.shape
+        _, _, D2 = input2.shape
+
+        # Compute outer product for each sequence position
+        # Reshape for batch matrix multiplication
+        input1_reshaped = input1.reshape(S * B, D1, 1)  # (S*B, D1, 1)
+        input2_reshaped = input2.reshape(S * B, 1, D2)  # (S*B, 1, D2)
+
+        # Outer product at each position
+        outer = torch.bmm(input1_reshaped, input2_reshaped)  # (S*B, D1, D2)
+
+        # Reshape back to separate sequence and batch
+        outer = outer.reshape(S, B, D1, D2)  # (S, B, D1, D2)
+
+        # Flatten the feature dimensions
+        outer = outer.reshape(S, B, D1 * D2)  # (S, B, D1*D2)
+
+        # SUM over sequence dimension
+        summed = outer.sum(dim=0)  # (B, D1*D2)
+
+        return summed
 
 
 class TensorProductEncoder(nn.Module):
@@ -171,25 +191,43 @@ class TensorProductEncoder(nn.Module):
         self.sum_layer = SumFlattenedOuterProduct()
         self.last_layer = nn.Linear(filler_dim * role_dim, final_layer_width)
 
+    def forward(self, fillers, roles, return_encoding=False):
+        # Forward pass with optional encoding return
+        # fillers, roles: (B, S) where B is batch size, S is sequence length
 
+        filler_embed = self.filler_embed(fillers)  # (B, S, filler_dim)
+        role_embed = self.role_embed(roles)  # (B, S, role_dim)
 
+        # Convert to sequence-first format for binding operation
+        filler_embed_seq = filler_embed.transpose(0, 1)  # (S, B, filler_dim)
+        role_embed_seq = role_embed.transpose(0, 1)  # (S, B, role_dim)
 
+        # Tensor product (this is the TPDN encoding)
+        tensor_product = self.sum_layer(filler_embed_seq, role_embed_seq)  # (B, filler_dim * role_dim)
 
-    def forward(self, fillers, roles):
-
-        # Forward pass with activation capture
-        filler_embed = self.filler_embed(fillers)
-        role_embed = self.role_embed(roles)
-
-
-
-        # Tensor product
-        tensor_product = self.sum_layer(filler_embed, role_embed)
+        # Debug: Print shapes on first call
+        if not hasattr(self, '_shape_printed'):
+            print(f"\n[DEBUG] Forward pass shapes:")
+            print(f"  Input fillers: {fillers.shape}")
+            print(f"  Input roles: {roles.shape}")
+            print(f"  Filler embeddings: {filler_embed.shape}")
+            print(f"  Role embeddings: {role_embed.shape}")
+            print(f"  Tensor product: {tensor_product.shape}")
+            print(f"  Expected last_layer input: ({tensor_product.size(0)}, {self.last_layer.in_features})")
+            print(f"  Expected last_layer output: ({tensor_product.size(0)}, {self.last_layer.out_features})")
+            self._shape_printed = True
 
         # Final projection
-        output = self.last_layer(tensor_product)
+        output = self.last_layer(tensor_product)  # (B, final_layer_width)
 
-        return output
+        if not hasattr(self, '_output_shape_printed'):
+            print(f"  Output shape: {output.shape}")
+            self._output_shape_printed = True
+
+        if return_encoding:
+            return output, tensor_product
+        else:
+            return output
 
 
 def batchify(data, batch_size):
@@ -228,7 +266,12 @@ def train_model(model, train_batches, optimizer, criterion, batch_size):
         cur_loss = 0
 
         for filler_in, role_in, target_out in batch:
-            enc_out = model(filler_in, role_in)
+            enc_out = model(filler_in, role_in)  # (B, seq_len) where B is batch size
+
+            # Ensure target has the same shape as output
+            # target_out is (1, B, seq_len), we need (B, seq_len)
+            target_out = target_out.squeeze(0)  # (B, seq_len)
+
             cur_loss += criterion(enc_out, target_out)
 
         cur_loss.backward()
@@ -245,8 +288,9 @@ def evaluate(model, data):
 
     with torch.no_grad():
         for instance in data:
-            pred = model(instance.filler, instance.role)
-            total_mse += torch.mean(torch.pow(pred - instance.rep, 2))
+            pred = model(instance.filler, instance.role)  # (1, seq_len)
+            target = instance.rep  # (1, seq_len)
+            total_mse += torch.mean(torch.pow(pred - target, 2))
 
     return float(total_mse / len(data))
 
@@ -270,11 +314,17 @@ def run_tpdn(train_data, valid_data, test_data, device, role_scheme='l2r'):
     print(f"  Number of roles: {num_roles}")
     print(f"  Role dimension: {role_dim}")
     print(f"  Filler dimension: {filler_dim}")
-    print(f"  Representation size: {rep_size}")
+    print(f"  Representation size (seq_len): {rep_size}")
+    print(f"  TPDN encoding dimension: {role_dim * filler_dim}")
 
     # Create model
     model = TensorProductEncoder(num_roles, num_fillers, role_dim, filler_dim, rep_size)
     model.to(device)
+
+    # Debug: Print model architecture
+    print(f"\nModel Architecture:")
+    print(f"  Binding output: {role_dim * filler_dim}")
+    print(f"  Last layer: Linear({role_dim * filler_dim}, {rep_size})")
 
     # Training configuration
     batch_size = 32
@@ -289,6 +339,15 @@ def run_tpdn(train_data, valid_data, test_data, device, role_scheme='l2r'):
 
     # Prepare batches
     train_batches = batchify(train_data, batch_size)
+
+    print(f"\nBatch info:")
+    print(f"  Number of batches: {len(train_batches)}")
+    if train_batches:
+        filler_sample, role_sample, target_sample = train_batches[0]
+        print(f"  Sample batch shapes:")
+        print(f"    Fillers: {filler_sample.shape}")
+        print(f"    Roles: {role_sample.shape}")
+        print(f"    Targets: {target_sample.shape}")
 
     # Track losses
     train_losses = []
@@ -373,6 +432,11 @@ def run_tpdn(train_data, valid_data, test_data, device, role_scheme='l2r'):
                        f'model_outputs_test_{role_scheme}.json',
                        role_scheme, id2role, max_instances=None)
 
+    # Save TPDN encodings for test set
+    save_tpdn_encodings(model, test_data,
+                        f'tpdn_encodings_test_{role_scheme}.json',
+                        role_scheme, id2role)
+
     return model
 
 
@@ -402,7 +466,6 @@ def save_model_outputs(model, data, filename, role_scheme, id2role, max_instance
             model_output = model(instance.filler, instance.role).squeeze(0)
             target = instance.rep.squeeze(0)
 
-
             # Extract data
             filler_ids = instance.filler.squeeze(0).cpu().numpy().tolist()
             role_ids = instance.role.squeeze(0).cpu().numpy().tolist()
@@ -410,8 +473,6 @@ def save_model_outputs(model, data, filename, role_scheme, id2role, max_instance
 
             # Calculate loss for this instance
             instance_loss = torch.mean(torch.pow(model_output - target, 2)).item()
-
-
 
             # Create entry
             entry = {
@@ -441,6 +502,66 @@ def save_model_outputs(model, data, filename, role_scheme, id2role, max_instance
     print(f"  Max MSE: {np.max(mse_values):.6f}")
 
 
+def save_tpdn_encodings(model, data, filename, role_scheme, id2role):
+    """
+    Save TPDN encodings (tensor product representations) to JSON file.
+
+    Args:
+        model: Trained TensorProductEncoder model
+        data: List of Instance objects
+        filename: Output JSON filename
+        role_scheme: Role scheme used
+        id2role: Dictionary mapping role IDs to role names
+    """
+    print(f"\n" + "=" * 60)
+    print(f"SAVING TPDN ENCODINGS FOR TEST SET")
+    print("=" * 60)
+    print(f"Generating TPDN encodings for {filename}...")
+
+    model.eval()
+    encodings = []
+
+    with torch.no_grad():
+        for i in tqdm(range(len(data)), desc="Extracting encodings"):
+            instance = data[i]
+
+            # Forward pass with encoding extraction
+            model_output, tensor_product = model(instance.filler, instance.role, return_encoding=True)
+
+            # Squeeze and convert to numpy
+            encoding = tensor_product.squeeze(0).cpu().numpy()
+            target = instance.rep.squeeze(0).cpu().numpy()
+            output = model_output.squeeze(0).cpu().numpy()
+
+            # Extract metadata
+            filler_ids = instance.filler.squeeze(0).cpu().numpy().tolist()
+            role_ids = instance.role.squeeze(0).cpu().numpy().tolist()
+            role_names = [id2role.get(rid, f'[UNK-{rid}]') for rid in role_ids]
+
+            # Create entry
+            entry = {
+                'instance_id': i,
+                'filler_ids': filler_ids,
+                'role_ids': role_ids,
+                'role_names': role_names,
+                'role_scheme': role_scheme,
+                'tpdn_encoding': encoding.tolist(),
+                'encoding_dimension': len(encoding),
+                'target_sequence': target.tolist(),
+                'reconstructed_sequence': output.tolist()
+            }
+            encodings.append(entry)
+
+    # Save to JSON
+    with open(filename, 'w') as f:
+        json.dump(encodings, f, indent=2)
+
+    print(f"Saved {len(encodings)} TPDN encodings to {filename}")
+    print(f"  Encoding dimension: {encodings[0]['encoding_dimension']}")
+    print(f"  File size: {len(json.dumps(encodings)) / 1024:.2f} KB")
+    print("=" * 60)
+
+
 def main():
     # Set random seed
     device = set_seed(42)
@@ -453,19 +574,19 @@ def main():
     all_data = load_number_sequences('random_sequences.txt', device,
                                      role_scheme=role_scheme, normalize=True)
 
-    # Split into train/valid/test
+    # Split into train/valid/test (50%/10%/40%)
     n_total = len(all_data)
-    n_train = int(0.7 * n_total)
-    n_valid = int(0.15 * n_total)
+    n_train = int(0.5 * n_total)
+    n_valid = int(0.1 * n_total)
 
     train_data = all_data[:n_train]
     valid_data = all_data[n_train:n_train + n_valid]
     test_data = all_data[n_train + n_valid:]
 
-    print(f"\nData split:")
-    print(f"  Training: {len(train_data)} sequences")
-    print(f"  Validation: {len(valid_data)} sequences")
-    print(f"  Test: {len(test_data)} sequences")
+    print(f"\nData split (50%/10%/40%):")
+    print(f"  Training: {len(train_data)} sequences ({len(train_data) / n_total * 100:.1f}%)")
+    print(f"  Validation: {len(valid_data)} sequences ({len(valid_data) / n_total * 100:.1f}%)")
+    print(f"  Test: {len(test_data)} sequences ({len(test_data) / n_total * 100:.1f}%)")
     print("=" * 60)
 
     # Train model
