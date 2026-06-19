@@ -59,6 +59,39 @@ def entropy_loss(role_probs):
     return entropy.mean()
 
 
+def _role_logits_to_bsr(role_logits, batch_size):
+    """Return ROLE logits/probabilities in shape (batch, seq_len, n_roles)."""
+    if role_logits.dim() != 3:
+        raise RuntimeError(f"Expected role logits to be 3D, got {tuple(role_logits.shape)}")
+
+    # Common ROLE output shape is (seq_len, batch, n_roles).
+    if role_logits.size(1) == batch_size:
+        return role_logits.transpose(0, 1)
+
+    # Some implementations already return (batch, seq_len, n_roles).
+    if role_logits.size(0) == batch_size:
+        return role_logits
+
+    raise RuntimeError(
+        f"Could not infer role-logit layout from shape {tuple(role_logits.shape)} "
+        f"and batch_size={batch_size}"
+    )
+
+
+def pairwise_diversity_loss_from_probs(role_probs, pad_mask=None):
+    sim = torch.bmm(role_probs, role_probs.transpose(1, 2))
+
+    B, S, _ = sim.shape
+    eye = torch.eye(S, device=sim.device).unsqueeze(0)
+    offdiag = 1.0 - eye
+
+    if pad_mask is not None:
+        valid = (pad_mask.unsqueeze(1) & pad_mask.unsqueeze(2)).float()
+        offdiag = offdiag * valid
+
+    return (sim * offdiag).sum() / offdiag.sum().clamp_min(1.0)
+
+
 class RoleLearningInstance(object):
     def __init__(self, filler, target_encoding, target_roles=None):
         self.filler = filler                    # LongTensor [1, seq_len]
@@ -203,7 +236,9 @@ def train_epoch_role(
         use_regularization=True,
         temperature=1.0,
         entropy_weight=0.01,
-        mu=None, sigma=None
+        mu=None, sigma=None,
+        role_diversity_weight=0.01,
+        lambda_div=1.0
 ):
     """Train ROLE for one epoch to match TPDN encodings."""
     model.train()
@@ -246,22 +281,63 @@ def train_epoch_role(
         mse_loss = criterion(pred_flat, targ_flat)
         loss = mse_loss
 
-        # Optional regularization
+        # Pairwise role diversity regularization.
+        # This directly penalizes pairs of non-PAD tokens within the same image
+        # when they have similar role-assignment distributions.
+        if role_diversity_weight > 0:
+            role_probs = None
+
+            if hasattr(model, "role_assigner") and hasattr(model.role_assigner, "last_role_probs"):
+                role_probs = model.role_assigner.last_role_probs
+
+            if role_probs is None:
+                role_logits = _role_logits_to_bsr(
+                    role_predictions,
+                    batch_size=filler_batch.size(0)
+                )
+                role_probs = F.softmax(
+                    role_logits / max(temperature, 1e-8),
+                    dim=-1
+                )
+
+            if role_probs.size(0) != filler_batch.size(0):
+                role_probs = role_probs.transpose(0, 1)
+
+            pad_mask = filler_batch != 0
+
+            role_div_loss = pairwise_diversity_loss_from_probs(
+                role_probs,
+                pad_mask=pad_mask
+            )
+
+            weighted_role_div = role_diversity_weight * role_div_loss
+            loss = loss + weighted_role_div
+
+            # Debug print once per epoch
+            if num_updates == 0:
+                print(
+                    f"MSE={mse_loss.item():.4f} | "
+                    f"role_div={role_div_loss.item():.4f} | "
+                    f"weighted_role_div={weighted_role_div.item():.4f}"
+                )
+
+        # Optional regularization.
+        # We intentionally drop unique_loss because #sequence positions can exceed
+        # #role indices; uniqueness is therefore not the right constraint here.
         if use_regularization:
-            one_hot_loss, l2_loss, unique_loss = model.get_regularization_loss(role_predictions)
-            reg_loss = one_hot_loss + l2_loss + unique_loss
+            one_hot_loss, l2_loss, _ = model.get_regularization_loss(role_predictions)
+            reg_loss = one_hot_loss + l2_loss
             loss = loss + reg_loss
 
             total_one_hot += float(one_hot_loss.item())
             total_l2 += float(l2_loss.item())
 
-        # Entropy regularization
+        # Optional legacy entropy regularization. Keep disabled when using
+        # pairwise_diversity_loss unless explicitly experimenting.
         if entropy_weight > 0:
-            # Get role probabilities
-            role_probs = F.softmax(role_predictions / temperature, dim=-1)
+            role_probs = F.softmax(_role_logits_to_bsr(role_predictions, batch_size=filler_batch.size(0)) / max(temperature, 1e-8), dim=-1)
             ent_loss = entropy_weight * entropy_loss(role_probs)
             loss = loss + ent_loss
-            total_entropy += float(ent_loss.item())
 
         # Backward
         loss.backward()
@@ -322,82 +398,173 @@ def evaluate_role(role_model, data, temperature=1.0, mu=None, sigma=None):
 # --------------------
 
 @torch.no_grad()
-def snapshot_role_distributions(role_model, data, device, out_dir="role_plots_fmri",
-                                epoch_idx=0, max_items=32, temperature=1.0):
-    """Run a fixed mini-batch through ROLE and save role assignment distribution plots.
-
-    Saves:
-      - out_dir/role_dist_epoch_XXX.png: heatmap of average P(role | position)
-
-    Returns:
-      dict with:
-        - entropy: mean role-distribution entropy per sequence position
-        - sparsity: mean max role probability per sequence position
+def snapshot_role_distributions(
+    role_model,
+    data,
+    device,
+    out_dir="role_plots_fmri",
+    epoch_idx=0,
+    max_items=32,
+    temperature=1.0,
+):
     """
+    Save one role-distribution heatmap per image.
+
+    Returns
+    -------
+    {
+        "entropy": [...],
+        "sparsity": [...]
+    }
+    """
+
     import os
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import torch.nn.functional as F
+
     os.makedirs(out_dir, exist_ok=True)
 
+    epoch_dir = os.path.join(out_dir, f"epoch_{epoch_idx + 1:03d}")
+    os.makedirs(epoch_dir, exist_ok=True)
+
     n = min(max_items, len(data))
+
     if n <= 0:
-        return {"entropy": [], "sparsity": []}
+        return {
+            "entropy": [],
+            "sparsity": [],
+        }
 
     fillers = []
+
     for i in range(n):
         f = data[i].filler
+
         if f.dim() == 2 and f.size(0) == 1:
             f = f.squeeze(0)
         elif f.dim() != 1:
             f = f.view(-1)
+
         fillers.append(f)
 
-    filler_batch = torch.stack(fillers, dim=0).to(device)  # (B, S)
+    filler_batch = torch.stack(fillers, dim=0).to(device)
 
     role_model.eval()
-    _, role_logits = role_model(filler_batch, None, temperature=temperature)  # commonly (S, B, R)
 
-    # Prefer the post-processed role probabilities stored by the role assigner, if available.
+    _, role_logits = role_model(
+        filler_batch,
+        None,
+        temperature=temperature,
+    )
+
     role_probs = None
-    if hasattr(role_model, "role_assigner") and hasattr(role_model.role_assigner, "last_role_probs"):
+
+    if (
+        hasattr(role_model, "role_assigner")
+        and hasattr(role_model.role_assigner, "last_role_probs")
+    ):
         role_probs = role_model.role_assigner.last_role_probs
 
     if role_probs is None:
-        # Fallback: softmax over role logits.
-        if role_logits.dim() == 3:
-            # Convert (S, B, R) to (B, S, R) if needed.
-            if role_logits.size(1) == filler_batch.size(0):
-                role_logits_bsr = role_logits.transpose(0, 1)
-            else:
-                role_logits_bsr = role_logits
-            role_probs = F.softmax(role_logits_bsr / max(temperature, 1e-8), dim=-1)
-        else:
-            raise RuntimeError(f"Unexpected role_logits shape: {tuple(role_logits.shape)}")
+        if role_logits.dim() != 3:
+            raise RuntimeError(
+                f"Unexpected role_logits shape: {tuple(role_logits.shape)}"
+            )
 
-    # Ensure shape is (B, S, R).
+        if role_logits.size(1) == filler_batch.size(0):
+            role_logits = role_logits.transpose(0, 1)
+
+        role_probs = F.softmax(
+            role_logits / max(temperature, 1e-8),
+            dim=-1,
+        )
+
     if role_probs.dim() != 3:
-        raise RuntimeError(f"Unexpected role_probs shape: {tuple(role_probs.shape)}")
-    if role_probs.size(0) != filler_batch.size(0) and role_probs.size(1) == filler_batch.size(0):
+        raise RuntimeError(
+            f"Unexpected role_probs shape: {tuple(role_probs.shape)}"
+        )
+
+    if (
+        role_probs.size(0) != filler_batch.size(0)
+        and role_probs.size(1) == filler_batch.size(0)
+    ):
         role_probs = role_probs.transpose(0, 1)
 
-    role_dist = role_probs.mean(dim=0).detach().cpu().numpy()  # (S, R)
-    S, R = role_dist.shape
+    entropy_values = []
+    sparsity_values = []
 
-    plt.figure(figsize=(10, 6))
-    plt.imshow(role_dist, aspect="auto", cmap="viridis", vmin=0.0, vmax=max(1e-6, role_dist.max()))
-    plt.colorbar(label="P(role | position)")
-    plt.xlabel("Role index")
-    plt.ylabel("Position in sequence")
-    plt.title(f"ROLE assignment distribution | epoch {epoch_idx + 1}")
-    plt.tight_layout()
-    plt.savefig(os.path.join(out_dir, f"role_dist_epoch_{epoch_idx + 1:03d}.png"), dpi=200)
-    plt.close()
+    for image_idx in range(role_probs.size(0)):
 
-    summaries = {"entropy": [], "sparsity": []}
-    for s_idx in range(S):
-        p = np.clip(role_dist[s_idx], 1e-12, 1.0)
-        summaries["entropy"].append(float(-np.sum(p * np.log(p))))
-        summaries["sparsity"].append(float(np.max(p)))
+        image_probs = role_probs[image_idx].detach().cpu().numpy()
 
-    return summaries
+        filler_ids = filler_batch[image_idx].detach().cpu().numpy()
+        nonpad_mask = filler_ids != 0
+
+        plot_dist = image_probs[nonpad_mask]
+
+        if plot_dist.shape[0] == 0:
+            continue
+
+        S, R = plot_dist.shape
+
+        argmax_roles = np.argmax(plot_dist, axis=1)
+
+        print(
+            f"[role snapshot] epoch={epoch_idx + 1}, "
+            f"image={image_idx + 1}, "
+            f"nonpad_positions={S}, "
+            f"argmax_roles={argmax_roles.tolist()}"
+        )
+
+        p = np.clip(plot_dist, 1e-12, 1.0)
+
+        entropy_per_position = -(p * np.log(p)).sum(axis=-1)
+        sparsity_per_position = np.max(p, axis=-1)
+
+        entropy_values.extend(entropy_per_position.tolist())
+        sparsity_values.extend(sparsity_per_position.tolist())
+
+        plt.figure(figsize=(10, max(3, min(8, 0.35 * S))))
+
+        plt.imshow(
+            plot_dist,
+            aspect="auto",
+            cmap="viridis",
+            vmin=0.0,
+            vmax=max(1e-6, float(plot_dist.max())),
+        )
+
+        plt.colorbar(label="P(role | position)")
+        plt.xlabel("Role index")
+        plt.ylabel("Non-PAD sequence position")
+
+        plt.title(
+            f"ROLE assignment distribution | "
+            f"epoch {epoch_idx + 1} | "
+            f"image {image_idx + 1}"
+        )
+
+        plt.xticks(range(R))
+        plt.yticks(range(S))
+
+        plt.tight_layout()
+
+        plt.savefig(
+            os.path.join(
+                epoch_dir,
+                f"role_dist_epoch_{epoch_idx + 1:03d}"
+                f"_image_{image_idx + 1:03d}.png",
+            ),
+            dpi=200,
+        )
+
+        plt.close()
+
+    return {
+        "entropy": entropy_values,
+        "sparsity": sparsity_values,
+    }
 
 
 def plot_role_summaries(role_entropy_hist, role_sparsity_hist, role_epochs=None, out_dir="role_plots_fmri"):
@@ -518,10 +685,10 @@ def main():
     SEED = 42
 
     # ROLE training (from scratch)
-    TOTAL_ROLE_EPOCHS = 20
+    TOTAL_ROLE_EPOCHS = 50
     BATCH_SIZE = 4              # reduced from 16 to lower GPU memory usage
     ROLE_LR = 1e-4
-    USE_ROLE_REG = True
+    USE_ROLE_REG = False
     STANDARDIZE = True
 
     # Runtime: validate less frequently
@@ -532,7 +699,16 @@ def main():
     T_END = 0.5
 
     # Entropy regularizationm
-    ENTROPY_WEIGHT = 0.001
+    # Legacy entropy regularization. Set to 0 because the new loss below
+    # already contains a token-entropy term.
+    ENTROPY_WEIGHT = 0.0
+
+    # Pairwise role diversity regularization.
+    # ROLE_DIVERSITY_WEIGHT controls the overall contribution to the training loss.
+    # LAMBDA_DIV controls how strongly pairwise within-image role dissimilarity is
+    # penalized relative to sharp token-level assignments.
+    ROLE_DIVERSITY_WEIGHT = 1.0
+    LAMBDA_DIV = 1.0
 
     # Model architecture
     FILLER_DIM = 128    # post-squeeze binding dimension (BERT 768 -> 64 via embedder_squeeze)
@@ -550,7 +726,7 @@ def main():
 
     # Role assignment distribution tracking
     PLOT_ROLE_DISTS = True
-    ROLE_OUT_DIR = "role_plots_fmri_pca8_unique"
+    ROLE_OUT_DIR = "role_plots_fmri_pca8_pairwise_diversity_updated"
     ROLE_PLOT_EVERY = 5  # snapshot every N epochs
     ROLE_SAMPLE_SIZE = 8
 
@@ -655,7 +831,9 @@ def main():
     print(f"\nROLE training plan:")
     print(f"  Training from scratch for {total_role_epochs} epochs")
     print(f"  Temperature annealing: {T_START} → {T_END}")
-    print(f"  Entropy regularization weight: {ENTROPY_WEIGHT}")
+    print(f"  Legacy entropy regularization weight: {ENTROPY_WEIGHT}")
+    print(f"  Role diversity weight: {ROLE_DIVERSITY_WEIGHT}")
+    print(f"  Pairwise diversity lambda: {LAMBDA_DIV}")
     print(f"  Validation interval: every {EVAL_INTERVAL} epochs")
     print(f"  Checkpoint selection: pure val MSE")
 
@@ -699,7 +877,9 @@ def main():
             temperature=temperature,
             entropy_weight=ENTROPY_WEIGHT,
             mu=enc_mu,
-            sigma=enc_sigma
+            sigma=enc_sigma,
+            role_diversity_weight=ROLE_DIVERSITY_WEIGHT,
+            lambda_div=LAMBDA_DIV
         )
 
         role_train_mse_hist.append(avg_mse)
