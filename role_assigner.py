@@ -1,178 +1,217 @@
+import math
 import torch
 import torch.nn as nn
-
-if torch.cuda.is_available():
-    device = torch.device('cuda')
-else:
-    device = torch.device('cpu')
+import itertools
+from typing import Optional
 
 
-class RoleAssignmentLSTM(nn.Module):
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model: int, max_len: int = 5000):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2, dtype=torch.float32)
+            * (-math.log(10000.0) / d_model)
+        )
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer("pe", pe.unsqueeze(1))  # (max_len, 1, d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        seq_len = x.size(0)
+        return x + self.pe[:seq_len]
+
+
+def sinkhorn_logspace(log_alpha: torch.Tensor, n_iters: int = 20, eps: float = 1e-9) -> torch.Tensor:
+    """
+    Sinkhorn normalization in log-space to produce a doubly-stochastic matrix.
+    log_alpha: (B, S, R)
+    returns:   (B, S, R) with rows/cols approximately summing to 1
+    """
+    for _ in range(n_iters):
+        # Row normalize: sum over roles (dim=2) -> 1
+        log_alpha = log_alpha - torch.logsumexp(log_alpha, dim=2, keepdim=True)
+        # Col normalize: sum over positions (dim=1) -> 1
+        log_alpha = log_alpha - torch.logsumexp(log_alpha, dim=1, keepdim=True)
+    P = torch.exp(log_alpha)
+    # numerical cleanup (optional)
+    return P.clamp_min(eps)
+
+
+class RoleAssignmentTransformer(nn.Module):
+    """
+    Transformer-based role assigner that predicts a role distribution
+    over `num_roles` for each position in the input sequence.
+
+    MODIFIED: Added temperature parameter support for training stability
+    """
+
     def __init__(
             self,
-            num_roles,
-            filler_embedding,
-            hidden_dim,
-            role_embedding_dim,
-            num_layers=1,
-            role_assignment_shrink_filler_dim=None,
-            bidirectional=False,
-            softmax_roles=False
+            num_roles: int,
+            filler_embedding: nn.Embedding,
+            d_model: int,
+            role_embedding_dim: int,
+            num_layers: int = 4,
+            nhead: int = 8,
+            dim_feedforward: Optional[int] = None,
+            dropout: float = 0.1,
+            softmax_roles: bool = True,
+            role_assignment_shrink_filler_dim: Optional[int] = None,
+            use_sinkhorn: bool = True,
+            sinkhorn_iters: int = 80,
+            sinkhorn_tau: float = 2.0
+            , sinkhorn_tau_anneal: float = 0.97
+            , sinkhorn_tau_min: float = 0.7
+            , hard_permutation_eval: bool = True
     ):
-        super(RoleAssignmentLSTM, self).__init__()
-        # TODO: when we move to language models, we will need to use pre-trained word embeddings.
-        # See embedder_squeeze in TensorProductEncoder
-
-        self.snap_one_hot_predictions = False
-
-        self.filler_embedding = filler_embedding
-        filler_embedding_dim = filler_embedding.embedding_dim
-
-        self.shrink_filler = False
-        if role_assignment_shrink_filler_dim:
-            self.shrink_filler = True
-            self.filler_shrink_layer = nn.Linear(filler_embedding.embedding_dim,
-                                                 role_assignment_shrink_filler_dim)
-            filler_embedding_dim = role_assignment_shrink_filler_dim
-
-        self.num_layers = num_layers
-        self.hidden_dim = hidden_dim
+        super().__init__()
         self.num_roles = num_roles
-        self.bidirectional = bidirectional
-
-        # OPTION we may want the LSTM to be bidirectional for things like RTL roles.
-        # Also, should the output size be the number of roles for the weight vector?
-        # Or is the output of variable size and we apply a linear transformation
-        # to get the weight vector?
-        self.lstm = nn.LSTM(filler_embedding_dim, hidden_dim, bidirectional=bidirectional,
-                            num_layers=self.num_layers)
-        if bidirectional:
-            print("The role assignment LSTM is bidirectional")
-            self.role_weight_predictions = nn.Linear(hidden_dim * 2, num_roles)
-        else:
-            self.role_weight_predictions = nn.Linear(hidden_dim, num_roles)
-
         self.softmax_roles = softmax_roles
-        if softmax_roles:
-            print("Use softmax for role predictions")
-            # The output of role_weight_predictions is shape
-            # (sequence_length, batch_size, num_roles)
-            # We want to softmax across the roles so set dim=2
-            self.softmax = nn.Softmax(dim=2)
+        self.snap_one_hot_predictions = False
+        self.use_sinkhorn = use_sinkhorn
+        self.sinkhorn_iters = sinkhorn_iters
+        self.sinkhorn_tau = sinkhorn_tau
+        self.sinkhorn_tau_anneal = sinkhorn_tau_anneal
+        self.sinkhorn_tau_min = sinkhorn_tau_min
+        self.hard_permutation_eval = hard_permutation_eval
+        self.last_role_probs: Optional[torch.Tensor] = None  # (B,S,R) post-normalization
+        self.last_role_logits: Optional[torch.Tensor] = None  # (B,S,R) raw logits
 
-        self.role_embedding = nn.Embedding(num_roles, role_embedding_dim)
-        self.role_indices = torch.tensor([x for x in range(num_roles)], device=device)
+        # ---- Filler embeddings ----
+        self.filler_embedding = filler_embedding
+        embed_dim = filler_embedding.embedding_dim
 
-    def forward(self, filler_tensor):
-        """
-        :param filler_tensor: This input tensor should be of shape (batch_size, sequence_length)
-        :param filler_lengths: A list of the length of each sequence in the batch. This is used
-            for padding the sequences.
-        :return: A tensor of size (sequence_length, batch_size, role_embedding_dim) with the role
-            embeddings for the input filler_tensor.
-        """
-        batch_size = len(filler_tensor)
-        hidden = self.init_hidden(batch_size)
+        # Optionally shrink filler dim
+        self.shrink_filler = False
+        if role_assignment_shrink_filler_dim is not None:
+            self.shrink_filler = True
+            self.filler_shrink_layer = nn.Linear(
+                embed_dim, role_assignment_shrink_filler_dim
+            )
+            embed_dim = role_assignment_shrink_filler_dim
 
-        fillers_embedded = self.filler_embedding(filler_tensor)
-        if self.shrink_filler:
-            fillers_embedded = self.filler_shrink_layer(fillers_embedded)
-        # The shape of fillers_embedded should be
-        # (batch_size, sequence_length, filler_embedding_dim)
-        # Pytorch LSTM expects data in the shape (sequence_length, batch_size, feature_dim)
-        fillers_embedded = torch.transpose(fillers_embedded, 0, 1)
-
-        '''
-        fillers_embedded = torch.nn.utils.rnn.pack_padded_sequence(
-            fillers_embedded,
-            filler_lengths,
-            batch_first=False
+        # Project to model dimension if needed
+        self.pre_proj = (
+            nn.Identity() if embed_dim == d_model else nn.Linear(embed_dim, d_model)
         )
 
-        lstm_out, hidden = self.lstm(fillers_embedded, hidden)
-        lstm_out, _ = torch.nn.utils.rnn.pad_packed_sequence(lstm_out)
-        '''
-        lstm_out, hidden = self.lstm(fillers_embedded, hidden)
-        role_predictions = self.role_weight_predictions(lstm_out)
+        # Positional encoding + Transformer
+        self.pos_enc = PositionalEncoding(d_model)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward or (4 * d_model),
+            dropout=dropout,
+            batch_first=True,  # use (B, S, E)
+            activation="gelu",
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
-        if self.softmax_roles:
-            role_predictions = self.softmax(role_predictions)
-        # role_predictions is size (sequence_length, batch_size, num_roles)
+        # Predict role logits for each token
+        self.role_head = nn.Linear(d_model, num_roles)
 
-        role_embeddings = self.role_embedding(self.role_indices)
+        # Role embedding table
+        self.role_embedding = nn.Embedding(num_roles, role_embedding_dim)
+        nn.init.normal_(self.role_embedding.weight, mean=0.0, std=0.1)
 
-        # Normalize the embeddings. This is important so that role attention is not overruled by
-        # embeddings with different orders of magnitude.
-        role_embeddings = role_embeddings / torch.norm(role_embeddings, dim=1).unsqueeze(1)
-        # role_embeddings is size (num_roles, role_embedding_dim)
+    def set_sinkhorn_tau(self, tau: float) -> None:
+        """Manually set Sinkhorn temperature (tau)."""
+        self.sinkhorn_tau = float(max(tau, 1e-6))
 
-        # During evaluation, we want to snap the role predictions to a one-hot vector
-        if self.snap_one_hot_predictions:
-            one_hot_predictions = self.one_hot_embedding(torch.argmax(role_predictions, 2),
-                                                        self.num_roles)
-            roles = torch.matmul(one_hot_predictions, role_embeddings)
-        else:
-            roles = torch.matmul(role_predictions, role_embeddings)
-        # roles is size (sequence_length, batch_size, role_embedding_dim)
+    def step_sinkhorn_tau(self) -> float:
+        """Anneal Sinkhorn temperature multiplicatively down to sinkhorn_tau_min."""
+        self.sinkhorn_tau = float(max(self.sinkhorn_tau_min, self.sinkhorn_tau * self.sinkhorn_tau_anneal))
+        return self.sinkhorn_tau
 
-        return roles, role_predictions
-
-    def init_hidden(self, batch_size):
-        layer_multiplier = 1
-        if self.bidirectional:
-            layer_multiplier = 2
-
-        # The axes semantics are (num_layers, batch_size, hidden_dim)
-        # We need a tuple for the hidden state and the cell state of the LSTM.
-        return (torch.zeros(self.num_layers * layer_multiplier, batch_size, self.hidden_dim,
-                            device=device),
-                torch.zeros(self.num_layers * layer_multiplier, batch_size, self.hidden_dim,
-                            device=device))
-
-    def one_hot_embedding(self, labels, num_classes):
-        """Embedding labels to one-hot form.
-
-        Args:
-          labels: (LongTensor) class labels, sized [N,].
-          num_classes: (int) number of classes.
-
-        Returns:
-          (tensor) encoded labels, sized [N, #classes].
+    @staticmethod
+    def _best_permutation_from_probs(prob_bsr: torch.Tensor) -> torch.Tensor:
         """
-        y = torch.eye(num_classes, device=device)
-        return y[labels]
+        Convert soft assignment probs (B,S,R) to a hard permutation matrix (B,S,R)
+        that maximizes sum log probs. Uses brute-force for S<=7 (OK for S=6).
+        """
+        B, S, R = prob_bsr.shape
+        assert S == R, "Hard permutation requires S==R"
+        # Work on CPU for simplicity/stability
+        prob_cpu = prob_bsr.detach().cpu()
+        out = torch.zeros_like(prob_cpu)
+        perms = list(itertools.permutations(range(S)))  # S! permutations
+        for b in range(B):
+            P = prob_cpu[b]  # (S,R)
+            # avoid log(0)
+            logP = (P + 1e-12).log()
+            best_score = None
+            best_perm = None
+            for perm in perms:
+                score = 0.0
+                for s in range(S):
+                    score += float(logP[s, perm[s]].item())
+                if (best_score is None) or (score > best_score):
+                    best_score = score
+                    best_perm = perm
+            for s in range(S):
+                out[b, s, best_perm[s]] = 1.0
+        return out.to(prob_bsr.device)
 
+    def forward(self, filler_tensor: torch.LongTensor, temperature: float = 1.0):
+        """
+        filler_tensor : (B, S) of token indices
+        temperature : float, controls sharpness of role assignment (lower = sharper)
 
-if __name__ == "__main__":
-    import torch
+        Returns
+        --------
+        roles_embedded : (S, B, role_dim)
+        role_logits    : (S, B, num_roles)   <-- LOGITS, not softmax
+        """
+        device = filler_tensor.device
+        B, S = filler_tensor.shape
 
-    num_roles = 10
-    filler_embedding_dim = 20
-    num_fillers = 10
-    hidden_dim = 30
-    role_embedding_dim = 20
-    filler_embedding = torch.nn.Embedding(
-        num_fillers + 1,
-        filler_embedding_dim,
-        padding_idx=num_fillers
-    )
+        # Get embeddings
+        x = self.filler_embedding(filler_tensor)
+        if self.shrink_filler:
+            x = self.filler_shrink_layer(x)
+        x = self.pre_proj(x)
 
-    lstm = RoleAssignmentLSTM(
-        num_roles,
-        filler_embedding,
-        hidden_dim,
-        role_embedding_dim,
-        num_layers=2,
-        bidirectional=True,
-    )
+        # Positional encoding + transformer
+        x = self.pos_enc(x.transpose(0, 1)).transpose(0, 1)  # (B, S, D)
+        x = self.encoder(x)
 
-    #data = [[1, 2, 3, 4], [1, 8, 1, 0]]
-    data = [[2, 3], [1, 10]]
-    data_tensor = torch.tensor(data)
-    out = lstm(data_tensor, [2, 1])
-    print(out)
-    print('experiment 2')
-    data2 = [[1]]
-    data_tensor2 = torch.tensor(data2)
-    out2 = lstm(data_tensor2, [1])
-    print(out2)
+        # Predict role logits
+        logits = self.role_head(x)  # (B, S, num_roles)
+        #Stabilize logits to prevent role-head collapse
+        logits = logits - logits.mean(dim=-1, keepdim=True)
+        logits = logits / logits.std(dim=-1, keepdim=True).clamp_min(1e-6)
+        logits = logits.clamp(min=-10.0, max=10.0)
+        # MODIFIED: Apply temperature scaling to logits before normalization
+        # This allows for temperature annealing during training
+        scaled_logits = logits / max(temperature, 1e-6)
+
+        # Role embeddings (use scaled logits -> assignment here)
+        if self.use_sinkhorn and (self.num_roles == S):
+            # Combine both temperature and sinkhorn_tau
+            # Temperature controls the overall sharpness, sinkhorn_tau is for the algorithm
+            log_alpha = scaled_logits / max(self.sinkhorn_tau, 1e-6)
+            role_probs = sinkhorn_logspace(log_alpha, n_iters=self.sinkhorn_iters)  # (B, S, R)
+        else:
+            # Standard softmax with temperature
+            role_probs = torch.softmax(scaled_logits, dim=-1)  # (B, S, R)
+
+        # Optionally harden to a true permutation at evaluation time
+        if (not self.training) and self.hard_permutation_eval and (self.num_roles == S):
+            role_probs = self._best_permutation_from_probs(role_probs)
+
+        self.last_role_probs = role_probs
+
+        role_table = self.role_embedding.weight
+        role_table = role_table / (role_table.norm(dim=1, keepdim=True) + 1e-9)
+
+        roles_embedded_bs = role_probs @ role_table  # (B, S, role_dim)
+        roles_embedded = roles_embedded_bs.transpose(0, 1)
+
+        # IMPORTANT: return **logits**, not probs
+        # Note: We return the original logits (not temperature-scaled) for regularization
+        role_logits_sb = logits.transpose(0, 1)  # (S, B, num_roles)
+
+        return roles_embedded, role_logits_sb

@@ -249,7 +249,7 @@ def train_epoch_role(
     total_mse = 0.0
     total_one_hot = 0.0
     total_l2 = 0.0
-    total_entropy = 0.0
+    total_pairwise_div = 0.0
     num_updates = 0
 
     for batch in tqdm(train_batches, desc=f"Training ROLE (T={temperature:.2f})"):
@@ -310,6 +310,7 @@ def train_epoch_role(
                 pad_mask=pad_mask
             )
 
+            total_pairwise_div += float(role_div_loss.item())
             weighted_role_div = role_diversity_weight * role_div_loss
             loss = loss + weighted_role_div
 
@@ -354,7 +355,7 @@ def train_epoch_role(
         total_mse / denom,
         total_one_hot / denom,
         total_l2 / denom,
-        total_entropy / denom,
+        total_pairwise_div / denom,
     )
 
 
@@ -626,7 +627,7 @@ def plot_training_curves(role_train_mse, role_val_mse,
     plt.grid(True, linestyle="--", alpha=0.5)
     plt.legend()
     plt.tight_layout()
-    plt.savefig("role_mse_fmri_pca8_updated_arch_unique.png", dpi=200)
+    plt.savefig("role_mse_fmri_pca8_4_roles.png", dpi=200)
     plt.close()
     # ROLE R²
     plt.figure()
@@ -638,7 +639,7 @@ def plot_training_curves(role_train_mse, role_val_mse,
     plt.grid(True, linestyle="--", alpha=0.5)
     plt.legend()
     plt.tight_layout()
-    plt.savefig("role_r2_fmri_pca8_unique.png", dpi=200)
+    plt.savefig("role_r2_fmri_pca8_4_roles.png", dpi=200)
     plt.close()
 
     # ROLE Regularization losses
@@ -654,16 +655,16 @@ def plot_training_curves(role_train_mse, role_val_mse,
 
         if role_train_entropy is not None:
             entropy = np.array(role_train_entropy, dtype=float)
-            plt.plot(epochs_role, entropy + eps, marker="d", label="Entropy reg")
+            plt.plot(epochs_role, entropy + eps, marker="d", label="Pairwise diversity loss")
 
         plt.yscale("symlog", linthresh=1e-6)
         plt.xlabel("Epoch")
         plt.ylabel("Loss (symlog)")
-        plt.title("ROLE Model – Regularization losses (train)")
+        plt.title("ROLE Model – Pairwise diversity loss")
         plt.grid(True, linestyle="--", alpha=0.5)
         plt.legend()
         plt.tight_layout()
-        plt.savefig("role_model_reg_losses_fmri_pca16.png", dpi=200)
+        plt.savefig("role_model_pairwise_div_loss_fmri_pca8_4_roles.png", dpi=200)
         plt.close()
 
 
@@ -707,16 +708,16 @@ def main():
     # ROLE_DIVERSITY_WEIGHT controls the overall contribution to the training loss.
     # LAMBDA_DIV controls how strongly pairwise within-image role dissimilarity is
     # penalized relative to sharp token-level assignments.
-    ROLE_DIVERSITY_WEIGHT = 1.0
+    ROLE_DIVERSITY_WEIGHT = 5.0
     LAMBDA_DIV = 1.0
 
     # Model architecture
     FILLER_DIM = 128    # post-squeeze binding dimension (BERT 768 -> 64 via embedder_squeeze)
     ROLE_DIM = 10       # dense learned role embedding dim (independent of n_roles=80)
-    N_ROLES = 10       # total number of possible category positions play around with
+    N_ROLES = 4       # total number of possible category positions play around with
     HIDDEN_DIM = 768   # reduced from 768 to lower GPU memory usage
     NUM_LAYERS = 6     # reduced from 4 to lower GPU memory usage
-    N_HEAD = 12
+    N_HEAD = 12 # reduce num
     DROPOUT = 0.1
 
     # Sequence length cap: sequences longer than this are discarded.
@@ -726,7 +727,7 @@ def main():
 
     # Role assignment distribution tracking
     PLOT_ROLE_DISTS = True
-    ROLE_OUT_DIR = "role_plots_fmri_pca8_pairwise_diversity_updated"
+    ROLE_OUT_DIR = "role_plots_fmri_pca8_pairwise_diversity_4_roles"
     ROLE_PLOT_EVERY = 5  # snapshot every N epochs
     ROLE_SAMPLE_SIZE = 8
 
@@ -844,14 +845,14 @@ def main():
     print("TRAINING ROLE MODEL")
     print("=" * 80)
 
-    role_optimizer = optim.Adam(role_model.parameters(), lr=ROLE_LR)
+    role_optimizer = optim.Adam(role_model.parameters(), lr=ROLE_LR, weight_decay=1e-4)
     role_criterion = nn.MSELoss()
 
     # Histories (only for the new/resumed segment)
     role_train_mse_hist = []
     role_train_one_hot_hist = []
     role_train_l2_hist = []
-    role_train_entropy_hist = []
+    role_pairwise_div_hist = []
     role_val_mse_hist = []
     role_train_r2_hist = []
     role_val_r2_hist = []
@@ -868,7 +869,7 @@ def main():
     for epoch_0idx in range(start_epoch_0idx, total_role_epochs):
         temperature = get_temperature(epoch_0idx, total_role_epochs, T_START, T_END)
 
-        _, avg_mse, avg_one_hot, avg_l2, avg_entropy = train_epoch_role(
+        _, avg_mse, avg_one_hot, avg_l2, avg_pairwise_div = train_epoch_role(
             role_model,
             train_batches,
             role_optimizer,
@@ -885,7 +886,7 @@ def main():
         role_train_mse_hist.append(avg_mse)
         role_train_one_hot_hist.append(avg_one_hot)
         role_train_l2_hist.append(avg_l2)
-        role_train_entropy_hist.append(avg_entropy)
+        role_pairwise_div_hist.append(avg_pairwise_div)
 
         # Evaluate less frequently
         epoch_1idx = epoch_0idx + 1
@@ -910,7 +911,7 @@ def main():
                 f"Epoch {epoch_1idx}/{total_role_epochs} (T={temperature:.3f}): "
                 f"Train MSE={avg_mse:.6f}, Val MSE={val_mse:.6f}, "
                 f"Train R²={train_r2:.6f}, Val R²={val_r2:.6f}, "
-                f"Entropy={avg_entropy:.6f}"
+                f"Pairwise diversity={avg_pairwise_div:.6f}"
             )
 
             role_val_mse_hist.append(val_mse)
@@ -920,7 +921,7 @@ def main():
             print(
                 f"Epoch {epoch_1idx}/{total_role_epochs} (T={temperature:.3f}): "
                 f"Train MSE={avg_mse:.6f}, (skipping val; interval={EVAL_INTERVAL}) "
-                f"Entropy={avg_entropy:.6f}"
+                f"Pairwise diversity={avg_pairwise_div:.6f}"
             )
             role_val_mse_hist.append(float("nan"))
             role_train_r2_hist.append(float("nan"))
@@ -955,7 +956,7 @@ def main():
         role_val_r2_hist,
         role_train_one_hot=role_train_one_hot_hist,
         role_train_l2=role_train_l2_hist,
-        role_train_entropy=role_train_entropy_hist,
+        role_train_entropy=role_pairwise_div_hist,
     )
 
     if PLOT_ROLE_DISTS and role_entropy_hist:

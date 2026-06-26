@@ -18,6 +18,7 @@ class RoleLearningTensorProductEncoder(nn.Module):
       - Optional final linear to match downstream dimensionality
 
     MODIFIED: Added temperature parameter support for training stability
+    MODIFIED: Added pretrained_filler_embeddings support for frozen BERT embeddings
     """
 
     # to-do: lower learning rate
@@ -42,6 +43,7 @@ class RoleLearningTensorProductEncoder(nn.Module):
             unique_role_regularization_weight=1.2,
             role_assignment_shrink_filler_dim=None,
             embedder_squeeze=None,
+            pretrained_filler_embeddings=None,  # (num_fillers, filler_dim) tensor; if provided, frozen
     ):
         super().__init__()
 
@@ -55,8 +57,29 @@ class RoleLearningTensorProductEncoder(nn.Module):
         self.final_layer_width = final_layer_width
 
         # ---- Filler embedding (+ optional squeeze) ----
+        # If pretrained_filler_embeddings is provided, initialise the embedding layer from
+        # the BERT matrix (shape: n_fillers x bert_dim) and freeze it.
+        # If embedder_squeeze is also provided, a learnable linear layer then projects
+        # from bert_dim down to filler_dim before binding.
         self.embed_squeeze = False
-        if embedder_squeeze is None:
+        if pretrained_filler_embeddings is not None:
+            bert_dim = pretrained_filler_embeddings.shape[1]
+            assert pretrained_filler_embeddings.shape[0] == n_fillers, (
+                f"pretrained_filler_embeddings has {pretrained_filler_embeddings.shape[0]} rows "
+                f"but n_fillers={n_fillers}"
+            )
+            self.filler_embedding = nn.Embedding(n_fillers, bert_dim)
+            self.filler_embedding.weight = nn.Parameter(
+                pretrained_filler_embeddings.clone(), requires_grad=False
+            )
+            print(f"[RoleEncoder] Filler embeddings initialised from pretrained matrix "
+                  f"({n_fillers} x {bert_dim}) and frozen.")
+            if embedder_squeeze is not None:
+                # embedder_squeeze is ignored; squeeze goes directly bert_dim -> filler_dim
+                self.embed_squeeze = True
+                self.embedding_squeeze_layer = nn.Linear(bert_dim, self.filler_dim)
+                print(f"[RoleEncoder] Squeeze layer: {bert_dim} -> {self.filler_dim}")
+        elif embedder_squeeze is None:
             self.filler_embedding = nn.Embedding(self.n_fillers, self.filler_dim)
         else:
             self.embed_squeeze = True
@@ -77,6 +100,8 @@ class RoleLearningTensorProductEncoder(nn.Module):
             dropout=dropout,
             softmax_roles=softmax_roles,
             role_assignment_shrink_filler_dim=role_assignment_shrink_filler_dim,
+            hard_permutation_eval=False,  # disabled: S! permutation enumeration is
+                                          # only tractable for very short sequences (S<=7)
         )
 
         # ---- Binder selection (compute binder_output_dim) ----
@@ -205,7 +230,10 @@ class RoleLearningTensorProductEncoder(nn.Module):
             self.role_assigner.snap_one_hot_predictions = False
 
     def eval(self):
-        """Eval mode"""
+        """Eval mode — snap_one_hot_predictions is disabled because permutation
+        enumeration is only tractable for very short sequences (length ~6).
+        For longer sequences (e.g. length 80), 80! permutations would exhaust memory.
+        Soft role assignments are used during evaluation instead."""
         super().eval()
         if hasattr(self.role_assigner, 'snap_one_hot_predictions'):
-            self.role_assigner.snap_one_hot_predictions = True
+            self.role_assigner.snap_one_hot_predictions = False
