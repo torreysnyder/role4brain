@@ -501,6 +501,7 @@ def snapshot_role_distributions(
 
         filler_ids = filler_batch[image_idx].detach().cpu().numpy()
         nonpad_mask = filler_ids != 0
+        true_filler_ids = filler_ids[nonpad_mask]
 
         plot_dist = image_probs[nonpad_mask]
 
@@ -538,7 +539,7 @@ def snapshot_role_distributions(
 
         plt.colorbar(label="P(role | position)")
         plt.xlabel("Role index")
-        plt.ylabel("Non-PAD sequence position")
+        plt.ylabel("Non-PAD filler ID")
 
         plt.title(
             f"ROLE assignment distribution | "
@@ -547,7 +548,7 @@ def snapshot_role_distributions(
         )
 
         plt.xticks(range(R))
-        plt.yticks(range(S))
+        plt.yticks(range(S), true_filler_ids)
 
         plt.tight_layout()
 
@@ -627,19 +628,11 @@ def plot_training_curves(role_train_mse, role_val_mse,
     plt.grid(True, linestyle="--", alpha=0.5)
     plt.legend()
     plt.tight_layout()
-    plt.savefig("role_mse_fmri_pca8_4_roles.png", dpi=200)
-    plt.close()
-    # ROLE R²
-    plt.figure()
-    plt.plot(epochs_role, role_train_r2, marker="o", label="Train R²")
-    plt.plot(epochs_role, role_val_r2, marker="s", label="Val R²")
-    plt.xlabel("Epoch")
-    plt.ylabel("R²")
-    plt.title("ROLE Model Variance Explained (fMRI Encodings)")
+    plt.savefig("role_mse_fmri_pca8_6_heads_heatmaps.png", dpi=200)
     plt.grid(True, linestyle="--", alpha=0.5)
     plt.legend()
     plt.tight_layout()
-    plt.savefig("role_r2_fmri_pca8_4_roles.png", dpi=200)
+    plt.savefig("role_r2_fmri_pca8_6_heads_heatmaps.png", dpi=200)
     plt.close()
 
     # ROLE Regularization losses
@@ -664,7 +657,7 @@ def plot_training_curves(role_train_mse, role_val_mse,
         plt.grid(True, linestyle="--", alpha=0.5)
         plt.legend()
         plt.tight_layout()
-        plt.savefig("role_model_pairwise_div_loss_fmri_pca8_4_roles.png", dpi=200)
+        plt.savefig("role_model_pairwise_div_loss_fmri_pca8_6_heads_heatmaps.png", dpi=200)
         plt.close()
 
 
@@ -714,10 +707,10 @@ def main():
     # Model architecture
     FILLER_DIM = 128    # post-squeeze binding dimension (BERT 768 -> 64 via embedder_squeeze)
     ROLE_DIM = 10       # dense learned role embedding dim (independent of n_roles=80)
-    N_ROLES = 4       # total number of possible category positions play around with
-    HIDDEN_DIM = 768   # reduced from 768 to lower GPU memory usage
+    N_ROLES = 8       # total number of possible category positions play around with
+    HIDDEN_DIM = 384   # reduced from 768 to lower GPU memory usage
     NUM_LAYERS = 6     # reduced from 4 to lower GPU memory usage
-    N_HEAD = 12 # reduce num
+    N_HEAD = 6 # reduce num
     DROPOUT = 0.1
 
     # Sequence length cap: sequences longer than this are discarded.
@@ -727,9 +720,9 @@ def main():
 
     # Role assignment distribution tracking
     PLOT_ROLE_DISTS = True
-    ROLE_OUT_DIR = "role_plots_fmri_pca8_pairwise_diversity_4_roles"
+    ROLE_OUT_DIR = "role_plots_6_heads_updated_heatmaps"
     ROLE_PLOT_EVERY = 5  # snapshot every N epochs
-    ROLE_SAMPLE_SIZE = 8
+    ROLE_SAMPLE_SIZE = 20
 
     # =========================
     # Setup
