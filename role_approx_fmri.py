@@ -77,6 +77,46 @@ def _role_logits_to_bsr(role_logits, batch_size):
         f"and batch_size={batch_size}"
     )
 
+def filler_role_independence_loss(role_probs, filler_ids, eps=1e-8):
+    """
+    Penalize filler-specific role distributions that are too different
+    from the batch-level role distribution.
+
+    """
+    pad_mask = filler_ids != 0
+
+    p = role_probs[pad_mask]
+    ids = filler_ids[pad_mask]
+
+    if p.size(0) == 0:
+        return role_probs.new_tensor(0.0)
+
+    # Global role distribution across all non-PAD tokens
+    p_global = p.mean(dim=0).detach()
+
+    losses = []
+
+    for fid in torch.unique(ids):
+        fid_mask = ids == fid
+
+        # Need at least 2 occurrences to estimate filler-specific usage
+        if fid_mask.sum() < 2:
+            continue
+
+        p_filler = p[fid_mask].mean(dim=0)
+
+        # KL(p_filler || p_global)
+        kl = (
+            p_filler
+            * (torch.log(p_filler + eps) - torch.log(p_global + eps))
+        ).sum()
+
+        losses.append(kl)
+
+    if len(losses) == 0:
+        return role_probs.new_tensor(0.0)
+
+    return torch.stack(losses).mean()
 
 def pairwise_diversity_loss_from_probs(role_probs, pad_mask=None):
     sim = torch.bmm(role_probs, role_probs.transpose(1, 2))
@@ -93,11 +133,19 @@ def pairwise_diversity_loss_from_probs(role_probs, pad_mask=None):
 
 
 class RoleLearningInstance(object):
-    def __init__(self, filler, target_encoding, target_roles=None):
+    def __init__(
+        self,
+        filler,
+        target_encoding,
+        target_roles=None,
+        image_id=None,
+        split=None,
+    ):
         self.filler = filler                    # LongTensor [1, seq_len]
         self.target_encoding = target_encoding  # FloatTensor [1, encoding_dim]
         self.target_roles = target_roles        # LongTensor [1, seq_len]
-
+        self.image_id = image_id
+        self.split = split
 
 # --------------------
 # Data loading
@@ -160,6 +208,8 @@ def load_fmri_encodings(metadata_filename, targets_filename, device, expected_di
     for default_row, entry in enumerate(metadata):
         filler_ids = entry['filler_ids']
         fmri_row = int(entry.get('fmri_row', default_row))
+        image_id = entry.get('image_id')
+        split = entry.get('split')
         if fmri_row < 0 or fmri_row >= targets.shape[0]:
             skipped += 1
             continue
@@ -181,7 +231,15 @@ def load_fmri_encodings(metadata_filename, targets_filename, device, expected_di
         if role_t is not None:
             role_t = role_t.to(device)
 
-        data.append(RoleLearningInstance(filler_t, encoding_t, role_t))
+        data.append(
+            RoleLearningInstance(
+                filler_t,
+                encoding_t,
+                role_t,
+                image_id=image_id,
+                split=split,
+            )
+        )
 
     if not data:
         print("ERROR: No valid ROLE training instances were created.")
@@ -238,6 +296,7 @@ def train_epoch_role(
         entropy_weight=0.01,
         mu=None, sigma=None,
         role_diversity_weight=0.01,
+        filler_independence_weight=0.01,
         lambda_div=1.0
 ):
     """Train ROLE for one epoch to match TPDN encodings."""
@@ -250,6 +309,7 @@ def train_epoch_role(
     total_one_hot = 0.0
     total_l2 = 0.0
     total_pairwise_div = 0.0
+    total_filler_independence = 0.0
     num_updates = 0
 
     for batch in tqdm(train_batches, desc=f"Training ROLE (T={temperature:.2f})"):
@@ -310,9 +370,13 @@ def train_epoch_role(
                 pad_mask=pad_mask
             )
 
+            filler_indep_loss = filler_role_independence_loss(role_probs, filler_batch)
+
             total_pairwise_div += float(role_div_loss.item())
+            total_filler_independence += float(filler_indep_loss.item())
             weighted_role_div = role_diversity_weight * role_div_loss
-            loss = loss + weighted_role_div
+            weighted_filler_indep = filler_independence_weight * filler_indep_loss
+            loss = loss + weighted_role_div + weighted_filler_indep
 
             # Debug print once per epoch
             if num_updates == 0:
@@ -320,6 +384,8 @@ def train_epoch_role(
                     f"MSE={mse_loss.item():.4f} | "
                     f"role_div={role_div_loss.item():.4f} | "
                     f"weighted_role_div={weighted_role_div.item():.4f}"
+                    f"filler_indep_loss={filler_indep_loss.item():.4f} | "
+                    f"weighted_filler_indep={weighted_filler_indep.item():.4f}"
                 )
 
         # Optional regularization.
@@ -356,6 +422,7 @@ def train_epoch_role(
         total_one_hot / denom,
         total_l2 / denom,
         total_pairwise_div / denom,
+        total_filler_independence/denom,
     )
 
 
@@ -393,6 +460,353 @@ def evaluate_role(role_model, data, temperature=1.0, mu=None, sigma=None):
 
     return mse, r2
 
+@torch.no_grad()
+def evaluate_filler_independence(
+    role_model,
+    data,
+    batch_size=64,
+    temperature=1.0,
+):
+    """
+    Compute filler-role independence loss across a validation dataset.
+
+    The complete validation set is accumulated before calculating the loss,
+    so repeated filler IDs can be compared across different images.
+
+    Returns
+    -------
+    float
+        Mean KL divergence between P(role | filler) and P(role).
+        Lower is better.
+    """
+    role_model.eval()
+
+    all_role_probs = []
+    all_filler_ids = []
+
+    for start in range(0, len(data), batch_size):
+        batch = data[start:start + batch_size]
+
+        filler_batch = torch.cat(
+            [inst.filler for inst in batch],
+            dim=0,
+        )
+
+        _, role_predictions = role_model(
+            filler_batch,
+            None,
+            temperature=temperature,
+        )
+
+        role_probs = None
+
+        if (
+            hasattr(role_model, "role_assigner")
+            and hasattr(role_model.role_assigner, "last_role_probs")
+        ):
+            role_probs = role_model.role_assigner.last_role_probs
+
+        if role_probs is None:
+            role_logits = _role_logits_to_bsr(
+                role_predictions,
+                batch_size=filler_batch.size(0),
+            )
+
+            role_probs = F.softmax(
+                role_logits / max(temperature, 1e-8),
+                dim=-1,
+            )
+
+        # Ensure (B, S, R)
+        if role_probs.size(0) != filler_batch.size(0):
+            if role_probs.size(1) == filler_batch.size(0):
+                role_probs = role_probs.transpose(0, 1)
+            else:
+                raise RuntimeError(
+                    f"Could not align role_probs shape "
+                    f"{tuple(role_probs.shape)} with batch size "
+                    f"{filler_batch.size(0)}"
+                )
+
+        all_role_probs.append(role_probs.detach())
+        all_filler_ids.append(filler_batch.detach())
+
+    if not all_role_probs:
+        return float("nan")
+
+    role_probs = torch.cat(all_role_probs, dim=0)
+    filler_ids = torch.cat(all_filler_ids, dim=0)
+
+    independence_loss = filler_role_independence_loss(
+        role_probs,
+        filler_ids,
+    )
+
+    return float(independence_loss.item())
+
+@torch.no_grad()
+def compute_filler_role_mutual_information(
+    role_model,
+    dataset,
+    device,
+    temperature=1.0,
+):
+    """
+    Computes I(Filler ; Role) using soft role assignments.
+
+    Returns
+    -------
+    mi_bits
+    """
+
+    import numpy as np
+    import torch
+    import torch.nn.functional as F
+
+    role_model.eval()
+
+    num_roles = role_model.n_roles
+    num_fillers = role_model.n_fillers
+
+    joint = np.zeros((num_fillers, num_roles), dtype=np.float64)
+
+    for inst in dataset:
+
+        fillers = inst.filler.to(device)
+
+        if fillers.dim() == 1:
+            fillers = fillers.unsqueeze(0)
+
+        _, role_logits = role_model(
+            fillers,
+            None,
+            temperature=temperature,
+        )
+
+        role_probs = role_model.role_assigner.last_role_probs
+
+        if role_probs is None:
+            if role_logits.size(1) == fillers.size(0):
+                role_logits = role_logits.transpose(0,1)
+
+            role_probs = F.softmax(
+                role_logits / temperature,
+                dim=-1,
+            )
+
+        filler_ids = fillers.squeeze(0).cpu().numpy()
+        probs = role_probs.squeeze(0).cpu().numpy()
+
+        mask = filler_ids != 0
+
+        filler_ids = filler_ids[mask]
+        probs = probs[mask]
+
+        for fid, p in zip(filler_ids, probs):
+            joint[fid] += p
+
+    joint /= joint.sum()
+
+    p_filler = joint.sum(axis=1, keepdims=True)
+    p_role = joint.sum(axis=0, keepdims=True)
+
+    eps = 1e-12
+
+    mi = (
+        joint *
+        np.log2(
+            (joint + eps) /
+            ((p_filler @ p_role) + eps)
+        )
+    ).sum()
+
+    return float(mi)
+
+def build_coco_bbox_lookup(instances, label_field="ground_truth"):
+    """Build a COCO ground-truth bbox lookup for the requested ROLE instances."""
+    from collections import defaultdict
+    from pathlib import Path
+
+    try:
+        import fiftyone.zoo as foz
+    except ImportError as exc:
+        raise ImportError(
+            "Role-colored bounding-box snapshots require FiftyOne. "
+            "Install FiftyOne or set PLOT_ROLE_BBOXES = False."
+        ) from exc
+
+    ids_by_split = defaultdict(list)
+    for inst in instances:
+        if inst.image_id is None or inst.split is None:
+            continue
+        ids_by_split[str(inst.split)].append(inst.image_id)
+
+    for split in list(ids_by_split.keys()):
+        ids_by_split[split] = list(dict.fromkeys(ids_by_split[split]))
+
+    lookup = {}
+
+    for split, image_ids in ids_by_split.items():
+        if not image_ids:
+            continue
+
+        print(
+            f"[role bbox] loading {len(image_ids)} COCO images "
+            f"from split '{split}'"
+        )
+
+        split_dataset = foz.load_zoo_dataset(
+            "coco-2017",
+            split=split,
+            label_types=["detections"],
+            image_ids=image_ids,
+        )
+
+        for sample in split_dataset:
+            coco_id = None
+
+            if sample.has_field("coco_id"):
+                coco_id = sample["coco_id"]
+
+            if coco_id is None:
+                try:
+                    coco_id = int(Path(sample.filepath).stem)
+                except (TypeError, ValueError):
+                    continue
+
+            labels = sample[label_field]
+            detections = []
+
+            if labels is not None:
+                for det in labels.detections:
+                    detections.append(
+                        {
+                            "label": det.label,
+                            "bounding_box": list(det.bounding_box),
+                        }
+                    )
+
+            lookup[int(coco_id)] = {
+                "filepath": sample.filepath,
+                "detections": detections,
+            }
+
+    print(f"[role bbox] prepared annotations for {len(lookup)} images")
+    return lookup
+
+
+def save_role_colored_bbox_image(
+    image_id,
+    role_probs_for_image,
+    filler_ids_for_image,
+    bbox_lookup,
+    label_to_filler_id,
+    output_path,
+):
+    """Draw ground-truth COCO boxes with colors determined by ROLE argmax."""
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as patches
+    from PIL import Image
+    import numpy as np
+
+    if image_id is None:
+        print("[role bbox] skipping image with missing image_id")
+        return False
+
+    try:
+        image_id_int = int(image_id)
+    except (TypeError, ValueError):
+        image_id_int = image_id
+
+    record = bbox_lookup.get(image_id_int)
+    if record is None:
+        print(f"[role bbox] no COCO bbox record found for image_id={image_id}")
+        return False
+
+    filler_ids_for_image = np.asarray(filler_ids_for_image)
+    nonpad_mask = filler_ids_for_image != 0
+    nonpad_filler_ids = filler_ids_for_image[nonpad_mask]
+    nonpad_probs = np.asarray(role_probs_for_image)[nonpad_mask]
+
+    filler_to_role = {
+        int(fid): int(np.argmax(prob))
+        for fid, prob in zip(nonpad_filler_ids, nonpad_probs)
+    }
+
+    image = Image.open(record["filepath"]).convert("RGB")
+    width, height = image.size
+
+    fig, ax = plt.subplots(figsize=(12, 8))
+    ax.imshow(image)
+    ax.axis("off")
+
+    cmap = plt.get_cmap("tab10")
+    roles_present = set()
+
+    for det in record["detections"]:
+        label = det["label"]
+        filler_id = label_to_filler_id.get(label)
+
+        if filler_id is None or int(filler_id) not in filler_to_role:
+            continue
+
+        role_idx = filler_to_role[int(filler_id)]
+        roles_present.add(role_idx)
+
+        x, y, w, h = det["bounding_box"]
+        x_px = x * width
+        y_px = y * height
+        w_px = w * width
+        h_px = h * height
+
+        color = cmap(role_idx % cmap.N)
+
+        rect = patches.Rectangle(
+            (x_px, y_px),
+            w_px,
+            h_px,
+            linewidth=3,
+            edgecolor=color,
+            facecolor="none",
+        )
+        ax.add_patch(rect)
+
+        ax.text(
+            x_px,
+            max(0, y_px - 4),
+            f"{label} | filler {int(filler_id)} | role {role_idx}",
+            fontsize=9,
+            color="white",
+            bbox={
+                "facecolor": color,
+                "edgecolor": color,
+                "alpha": 0.85,
+                "pad": 2,
+            },
+        )
+
+    legend_handles = [
+        patches.Patch(
+            facecolor=cmap(role_idx % cmap.N),
+            edgecolor=cmap(role_idx % cmap.N),
+            label=f"Role {role_idx}",
+        )
+        for role_idx in sorted(roles_present)
+    ]
+    if legend_handles:
+        ax.legend(
+            handles=legend_handles,
+            loc="upper right",
+            framealpha=0.9,
+            title="ROLE assignment",
+        )
+
+    ax.set_title(f"Role-colored ground-truth boxes | image {image_id}")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return True
+
 
 # --------------------
 # Role assignment tracking
@@ -407,9 +821,12 @@ def snapshot_role_distributions(
     epoch_idx=0,
     max_items=32,
     temperature=1.0,
+    plot_role_bboxes=False,
+    bbox_lookup=None,
+    label_to_filler_id=None,
 ):
     """
-    Save one role-distribution heatmap per image.
+    Save one role-distribution heatmap per image and optionally a role-colored bbox image.
 
     Returns
     -------
@@ -497,6 +914,8 @@ def snapshot_role_distributions(
 
     for image_idx in range(role_probs.size(0)):
 
+        image_id = data[image_idx].image_id
+
         image_probs = role_probs[image_idx].detach().cpu().numpy()
 
         filler_ids = filler_batch[image_idx].detach().cpu().numpy()
@@ -514,7 +933,7 @@ def snapshot_role_distributions(
 
         print(
             f"[role snapshot] epoch={epoch_idx + 1}, "
-            f"image={image_idx + 1}, "
+            f"image={image_id}, "
             f"nonpad_positions={S}, "
             f"argmax_roles={argmax_roles.tolist()}"
         )
@@ -544,7 +963,7 @@ def snapshot_role_distributions(
         plt.title(
             f"ROLE assignment distribution | "
             f"epoch {epoch_idx + 1} | "
-            f"image {image_idx + 1}"
+            f"image {image_id}"
         )
 
         plt.xticks(range(R))
@@ -556,12 +975,34 @@ def snapshot_role_distributions(
             os.path.join(
                 epoch_dir,
                 f"role_dist_epoch_{epoch_idx + 1:03d}"
-                f"_image_{image_idx + 1:03d}.png",
+                f"_image_{image_id}.png",
             ),
             dpi=200,
         )
 
         plt.close()
+
+        if plot_role_bboxes:
+            if bbox_lookup is None or label_to_filler_id is None:
+                raise ValueError(
+                    "plot_role_bboxes=True requires bbox_lookup and "
+                    "label_to_filler_id."
+                )
+
+            bbox_output_path = os.path.join(
+                epoch_dir,
+                f"role_bbox_epoch_{epoch_idx + 1:03d}"
+                f"_image_{image_id}.png",
+            )
+
+            save_role_colored_bbox_image(
+                image_id=image_id,
+                role_probs_for_image=image_probs,
+                filler_ids_for_image=filler_ids,
+                bbox_lookup=bbox_lookup,
+                label_to_filler_id=label_to_filler_id,
+                output_path=bbox_output_path,
+            )
 
     return {
         "entropy": entropy_values,
@@ -611,53 +1052,353 @@ def plot_role_summaries(role_entropy_hist, role_sparsity_hist, role_epochs=None,
     plt.savefig(os.path.join(out_dir, "role_sparsity_over_epochs.png"), dpi=200)
     plt.close()
 
-def plot_training_curves(role_train_mse, role_val_mse,
-                         role_train_r2, role_val_r2,
-                         role_train_one_hot=None,
-                         role_train_l2=None, role_train_entropy=None):
-    """Plot training curves."""
-    epochs_role = np.arange(1, len(role_train_mse) + 1)
+def plot_training_curves(
+    role_train_mse,
+    role_val_mse,
+    role_train_r2,
+    role_val_r2,
+    role_train_one_hot=None,
+    role_train_l2=None,
+    role_train_filler_independence=None,
+    role_filler_mi=None,
+    role_eval_epochs=None,
+    role_train_pairwise_diversity=None,
+):
+    """
+    Plot ROLE training curves using two history cadences.
 
-    # ROLE MSE
-    plt.figure()
-    plt.plot(epochs_role, role_train_mse, marker="o", label="Train MSE")
-    plt.plot(epochs_role, role_val_mse, marker="s", label="Val MSE")
-    plt.xlabel("Epoch")
-    plt.ylabel("MSE")
-    plt.title("ROLE Model Reconstruction MSE (fMRI Encodings)")
-    plt.grid(True, linestyle="--", alpha=0.5)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig("role_mse_fmri_pca8_6_heads_heatmaps.png", dpi=200)
-    plt.grid(True, linestyle="--", alpha=0.5)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig("role_r2_fmri_pca8_6_heads_heatmaps.png", dpi=200)
-    plt.close()
+    Every training epoch
+    --------------------
+    role_train_mse  (full train set, model.eval())
 
-    # ROLE Regularization losses
-    if role_train_one_hot is not None and role_train_l2 is not None:
-        plt.figure()
+    Evaluation epochs only
+    ----------------------
+    role_val_mse
+    role_train_r2
+    role_val_r2
+    role_filler_mi
+    role_eval_epochs
 
+    Every training epoch
+    --------------------
+    role_train_one_hot
+    role_train_l2
+    role_train_filler_independence
+    role_train_pairwise_diversity
+
+    This function is safe to call repeatedly during training. Each call
+    overwrites the same PNG files, so the plots always show the latest
+    available training history.
+    """
+
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    # ============================================================
+    # Evaluation-epoch histories
+    # ============================================================
+    if role_eval_epochs is None:
+        eval_epochs = np.arange(1, len(role_val_mse) + 1)
+    else:
+        eval_epochs = np.asarray(role_eval_epochs, dtype=int)
+
+    eval_histories = {
+        "role_val_mse": role_val_mse,
+        "role_train_r2": role_train_r2,
+        "role_val_r2": role_val_r2,
+    }
+
+    for name, values in eval_histories.items():
+        if values is None:
+            raise ValueError(f"{name} cannot be None.")
+
+        if len(values) != len(eval_epochs):
+            raise ValueError(
+                f"{name} has {len(values)} values, but "
+                f"role_eval_epochs has {len(eval_epochs)} values."
+            )
+
+    if role_filler_mi is not None:
+        if len(role_filler_mi) != len(eval_epochs):
+            raise ValueError(
+                f"role_filler_mi has {len(role_filler_mi)} values, but "
+                f"role_eval_epochs has {len(eval_epochs)} values."
+            )
+
+    # ============================================================
+    # Every-training-epoch histories
+    # ============================================================
+    per_epoch_histories = [
+        role_train_mse,
+        role_train_one_hot,
+        role_train_l2,
+        role_train_filler_independence,
+        role_train_pairwise_diversity,
+    ]
+
+    per_epoch_lengths = [
+        len(values)
+        for values in per_epoch_histories
+        if values is not None
+    ]
+
+    if per_epoch_lengths:
+        n_training_epochs = max(per_epoch_lengths)
+    elif len(eval_epochs) > 0:
+        n_training_epochs = int(eval_epochs[-1])
+    else:
+        n_training_epochs = 0
+
+    epochs_role = np.arange(1, n_training_epochs + 1)
+
+    def validate_per_epoch_history(name, values):
+        if values is None:
+            return
+
+        if len(values) != n_training_epochs:
+            raise ValueError(
+                f"{name} has {len(values)} values, but expected "
+                f"{n_training_epochs} values—one per actual training epoch."
+            )
+
+    validate_per_epoch_history(
+        "role_train_mse",
+        role_train_mse,
+    )
+    validate_per_epoch_history(
+        "role_train_one_hot",
+        role_train_one_hot,
+    )
+    validate_per_epoch_history(
+        "role_train_l2",
+        role_train_l2,
+    )
+    validate_per_epoch_history(
+        "role_train_filler_independence",
+        role_train_filler_independence,
+    )
+    validate_per_epoch_history(
+        "role_train_pairwise_diversity",
+        role_train_pairwise_diversity,
+    )
+
+    # ============================================================
+    # MSE:
+    # ============================================================
+    if len(eval_epochs) > 0:
+
+        plt.figure(figsize=(10, 6))
+
+        # Train MSE is recomputed in model.eval() after EVERY epoch.
+        train_mse_epochs = np.arange(1, len(role_train_mse) + 1)
+        plt.plot(
+            train_mse_epochs,
+            role_train_mse,
+            marker="o",
+            label="Train MSE",
+        )
+
+        # Validation MSE is available only at evaluation epochs.
+        plt.plot(
+            eval_epochs,
+            role_val_mse,
+            marker="s",
+            label="Validation MSE",
+        )
+
+        plt.xlabel("Epoch")
+        plt.ylabel("MSE")
+        plt.title(
+            "ROLE Model Reconstruction MSE (fMRI Encodings)"
+        )
+
+        plt.grid(
+            True,
+            linestyle="--",
+            alpha=0.5,
+        )
+
+        plt.legend()
+        plt.tight_layout()
+
+        plt.savefig(
+            "role_mse_reweighted_fi_role_div.png",
+            dpi=200,
+        )
+
+        plt.close()
+
+        # ========================================================
+        # R²
+        # ========================================================
+        plt.figure(figsize=(10, 6))
+
+        plt.plot(
+            eval_epochs,
+            role_train_r2,
+            marker="o",
+            label="Train R²",
+        )
+        plt.plot(
+            eval_epochs,
+            role_val_r2,
+            marker="s",
+            label="Validation R²",
+        )
+
+        plt.xlabel("Epoch")
+        plt.ylabel("R²")
+        plt.title("ROLE Model Variance Explained (fMRI Encodings)")
+        plt.grid(True, linestyle="--", alpha=0.5)
+        plt.legend()
+        plt.tight_layout()
+
+        plt.savefig(
+            "role_r2_reweighted_fi_role_div.png",
+            dpi=200,
+        )
+        plt.close()
+
+    # ============================================================
+    # Filler-independence loss
+    # ============================================================
+    if (
+        role_train_filler_independence is not None
+        and len(role_train_filler_independence) > 0
+    ):
+        filler_independence = np.asarray(
+            role_train_filler_independence,
+            dtype=float,
+        )
+
+        plt.figure(figsize=(10, 6))
+
+        plt.plot(
+            epochs_role,
+            filler_independence,
+            marker="d",
+            label="Filler independence loss",
+        )
+
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss")
+        plt.title("ROLE Model - Filler Independence Loss")
+        plt.grid(True, linestyle="--", alpha=0.5)
+        plt.legend()
+        plt.tight_layout()
+
+        plt.savefig(
+            "role_model_filler_independence_loss_reweighted_fi_role_div.png",
+            dpi=200,
+        )
+        plt.close()
+
+    # ============================================================
+    # Pairwise-diversity loss
+    # ============================================================
+    if (
+        role_train_pairwise_diversity is not None
+        and len(role_train_pairwise_diversity) > 0
+    ):
+        pairwise_diversity = np.asarray(
+            role_train_pairwise_diversity,
+            dtype=float,
+        )
+
+        plt.figure(figsize=(10, 6))
+
+        plt.plot(
+            epochs_role,
+            pairwise_diversity,
+            marker="d",
+            label="Pairwise diversity loss",
+        )
+
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss")
+        plt.title("ROLE Model - Pairwise Diversity Loss")
+        plt.grid(True, linestyle="--", alpha=0.5)
+        plt.legend()
+        plt.tight_layout()
+
+        plt.savefig(
+            "role_model_pairwise_diversity_loss_reweighted_fi_role_div.png",
+            dpi=200,
+        )
+        plt.close()
+
+    # ============================================================
+    # Filler-role mutual information
+    # ============================================================
+    if role_filler_mi is not None and len(role_filler_mi) > 0:
+        plt.figure(figsize=(8, 5))
+
+        plt.plot(
+            eval_epochs,
+            role_filler_mi,
+            marker="o",
+            linewidth=2,
+            label="Validation filler-role MI",
+        )
+
+        plt.xlabel("Epoch")
+        plt.ylabel("Mutual information (bits)")
+        plt.title("Filler-Role Mutual Information")
+        plt.grid(True, linestyle="--", alpha=0.5)
+        plt.legend()
+        plt.tight_layout()
+
+        plt.savefig(
+            "role_model_filler_role_mutual_information_reweighted_fi_role_div.png",
+            dpi=200,
+        )
+        plt.close()
+
+    # ============================================================
+    # Legacy model regularization losses
+    # ============================================================
+    if role_train_one_hot is not None or role_train_l2 is not None:
+        plt.figure(figsize=(10, 6))
         eps = 1e-12
-        one_hot = np.array(role_train_one_hot, dtype=float)
-        l2 = np.array(role_train_l2, dtype=float)
 
-        plt.plot(epochs_role, one_hot + eps, marker="o", label="One-hot reg")
-        plt.plot(epochs_role, l2 + eps, marker="^", label="L2 reg")
+        if role_train_one_hot is not None:
+            one_hot = np.asarray(
+                role_train_one_hot,
+                dtype=float,
+            )
 
-        if role_train_entropy is not None:
-            entropy = np.array(role_train_entropy, dtype=float)
-            plt.plot(epochs_role, entropy + eps, marker="d", label="Pairwise diversity loss")
+            plt.plot(
+                epochs_role,
+                one_hot + eps,
+                marker="o",
+                label="One-hot regularization",
+            )
+
+        if role_train_l2 is not None:
+            l2 = np.asarray(
+                role_train_l2,
+                dtype=float,
+            )
+
+            plt.plot(
+                epochs_role,
+                l2 + eps,
+                marker="^",
+                label="L2 regularization",
+            )
 
         plt.yscale("symlog", linthresh=1e-6)
         plt.xlabel("Epoch")
         plt.ylabel("Loss (symlog)")
-        plt.title("ROLE Model – Pairwise diversity loss")
+        plt.title("ROLE Model - Legacy Regularization Losses")
         plt.grid(True, linestyle="--", alpha=0.5)
         plt.legend()
         plt.tight_layout()
-        plt.savefig("role_model_pairwise_div_loss_fmri_pca8_6_heads_heatmaps.png", dpi=200)
+
+        plt.savefig(
+            "role_model_legacy_regularization_losses_reweighted_fi_role_div.png",
+            dpi=200,
+        )
         plt.close()
 
 
@@ -678,8 +1419,19 @@ def main():
     TARGET_ENCODING_DIM = 8
     SEED = 42
 
+    # Early stopping
+    EARLY_STOPPING_PATIENCE = 30
+    EARLY_STOPPING_MIN_DELTA = 1e-4
+    EARLY_STOPPING_WARMUP = 50
+
+    # Combined validation objective:
+    # val_score = val_mse + weight * val_filler_independence
+    EARLY_STOP_INDEPENDENCE_WEIGHT = 0.1
+
+    # Batch size used only for validation independence evaluation
+    INDEPENDENCE_EVAL_BATCH_SIZE = 64
     # ROLE training (from scratch)
-    TOTAL_ROLE_EPOCHS = 50
+    TOTAL_ROLE_EPOCHS = 150
     BATCH_SIZE = 4              # reduced from 16 to lower GPU memory usage
     ROLE_LR = 1e-4
     USE_ROLE_REG = False
@@ -701,7 +1453,8 @@ def main():
     # ROLE_DIVERSITY_WEIGHT controls the overall contribution to the training loss.
     # LAMBDA_DIV controls how strongly pairwise within-image role dissimilarity is
     # penalized relative to sharp token-level assignments.
-    ROLE_DIVERSITY_WEIGHT = 5.0
+    ROLE_DIVERSITY_WEIGHT = 4.9
+    FILLER_INDEPENDENCE_WEIGHT = 1.05
     LAMBDA_DIV = 1.0
 
     # Model architecture
@@ -720,9 +1473,14 @@ def main():
 
     # Role assignment distribution tracking
     PLOT_ROLE_DISTS = True
-    ROLE_OUT_DIR = "role_plots_6_heads_updated_heatmaps"
+    ROLE_OUT_DIR = "role_bbox_images_reweighted_fi_role_div"
     ROLE_PLOT_EVERY = 5  # snapshot every N epochs
-    ROLE_SAMPLE_SIZE = 20
+    ROLE_SAMPLE_SIZE = 25
+
+    # Role-colored ground-truth bounding-box snapshots.
+    # Uses COCO-2017 detections through FiftyOne, matching load_bbox_images.py.
+    PLOT_ROLE_BBOXES = True
+    FILLER_VOCAB_JSON = "bert_filler_vocab.json"
 
     # =========================
     # Setup
@@ -773,9 +1531,30 @@ def main():
         print(f"  Encoding mean: {enc_mu.mean().item():.4f}")
         print(f"  Encoding std: {enc_sigma.mean().item():.4f}")
 
-    train_set = data[: int(0.8 * len(data))]
-    test_set = data[int(0.8 * len(data)):]
+    split_indices = list(range(len(data)))
+    split_rng = random.Random(SEED)
+    split_rng.shuffle(split_indices)
+
+    split_idx = int(0.8 * len(split_indices))
+
+    train_indices = split_indices[:split_idx]
+    test_indices = split_indices[split_idx:]
+
+    train_set = [data[i] for i in train_indices]
+    test_set = [data[i] for i in test_indices]
     print(f"\nTrain: {len(train_set)}, Test: {len(test_set)}")
+
+    # Prepare bbox metadata once for the fixed snapshot images, rather than
+    # reloading COCO detections at every snapshot epoch.
+    bbox_lookup = None
+    label_to_filler_id = None
+
+    if PLOT_ROLE_BBOXES:
+        with open(FILLER_VOCAB_JSON, "r") as f:
+            label_to_filler_id = json.load(f)
+
+        snapshot_instances = test_set[: min(ROLE_SAMPLE_SIZE, len(test_set))]
+        bbox_lookup = build_coco_bbox_lookup(snapshot_instances)
 
     train_batches = batchify_with_roles(train_set, BATCH_SIZE)
 
@@ -829,7 +1608,10 @@ def main():
     print(f"  Role diversity weight: {ROLE_DIVERSITY_WEIGHT}")
     print(f"  Pairwise diversity lambda: {LAMBDA_DIV}")
     print(f"  Validation interval: every {EVAL_INTERVAL} epochs")
-    print(f"  Checkpoint selection: pure val MSE")
+    print(
+        f"  Checkpoint selection: "
+        f"val MSE + {EARLY_STOP_INDEPENDENCE_WEIGHT} × filler independence"
+    )
 
     # =========================
     # Train ROLE (resume)
@@ -841,28 +1623,39 @@ def main():
     role_optimizer = optim.Adam(role_model.parameters(), lr=ROLE_LR, weight_decay=1e-4)
     role_criterion = nn.MSELoss()
 
-    # Histories (only for the new/resumed segment)
-    role_train_mse_hist = []
+    # Histories
+    # Every training epoch:
+    role_optimization_mse_hist = []
     role_train_one_hot_hist = []
     role_train_l2_hist = []
     role_pairwise_div_hist = []
+    role_filler_independence_hist = []
+
+    # Evaluation epochs only:
+    role_train_mse_hist = []
     role_val_mse_hist = []
     role_train_r2_hist = []
     role_val_r2_hist = []
+    role_filler_mi_hist = []
 
     role_entropy_hist = []
     role_sparsity_hist = []
     role_snapshot_epochs = []
+    role_eval_epochs = []
 
     best_role_path = "best_role_model_fmri_pca16.pt"
     best_score = float("inf")
     best_role_epoch_1idx = None
     best_role_mse = float("inf")
+    best_role_filler_independence = float("inf")
+
+    early_stop_counter = 0
+    stopped_early = False
 
     for epoch_0idx in range(start_epoch_0idx, total_role_epochs):
         temperature = get_temperature(epoch_0idx, total_role_epochs, T_START, T_END)
 
-        _, avg_mse, avg_one_hot, avg_l2, avg_pairwise_div = train_epoch_role(
+        _, avg_mse, avg_one_hot, avg_l2, avg_pairwise_div, avg_filler_independence = train_epoch_role(
             role_model,
             train_batches,
             role_optimizer,
@@ -873,52 +1666,159 @@ def main():
             mu=enc_mu,
             sigma=enc_sigma,
             role_diversity_weight=ROLE_DIVERSITY_WEIGHT,
+            filler_independence_weight=FILLER_INDEPENDENCE_WEIGHT,
             lambda_div=LAMBDA_DIV
         )
 
-        role_train_mse_hist.append(avg_mse)
+        role_optimization_mse_hist.append(avg_mse)
         role_train_one_hot_hist.append(avg_one_hot)
         role_train_l2_hist.append(avg_l2)
         role_pairwise_div_hist.append(avg_pairwise_div)
+        role_filler_independence_hist.append(avg_filler_independence)
 
-        # Evaluate less frequently
+        # Recompute TRAIN MSE in eval mode after EVERY epoch.
+        # This is the blue curve and is directly comparable to validation MSE.
         epoch_1idx = epoch_0idx + 1
-        do_eval = (epoch_1idx == (start_epoch_0idx + 1)) or (epoch_1idx == total_role_epochs) or (epoch_1idx % EVAL_INTERVAL == 0)
+        train_eval_mse, train_r2_this_epoch = evaluate_role(
+            role_model,
+            train_set,
+            temperature=temperature,
+            mu=enc_mu,
+            sigma=enc_sigma,
+        )
+        role_train_mse_hist.append(train_eval_mse)
+
+        # Validation and the other expensive diagnostics remain every EVAL_INTERVAL epochs.
+        do_eval = (
+            epoch_1idx == (start_epoch_0idx + 1)
+            or epoch_1idx == total_role_epochs
+            or epoch_1idx % EVAL_INTERVAL == 0
+        )
 
         if do_eval:
-            train_eval_mse, train_r2 = evaluate_role(role_model, train_set, temperature=temperature, mu=enc_mu, sigma=enc_sigma)
-            val_mse, val_r2 = evaluate_role(role_model, test_set, temperature=temperature, mu=enc_mu, sigma=enc_sigma)
+            train_r2 = train_r2_this_epoch
 
-            # Checkpoint selection: pure val MSE
-            if val_mse < best_score:
-                best_score = float(val_mse)
-                best_role_epoch_1idx = epoch_1idx
-                best_role_mse = float(val_mse)
-                torch.save(role_model.state_dict(), best_role_path)
-                print(
-                    f"  ✓ Saved best ROLE model: {best_role_path} "
-                    f"(epoch={best_role_epoch_1idx}, mse={best_role_mse:.6f})"
-                )
+            val_mse, val_r2 = evaluate_role(
+                role_model,
+                test_set,
+                temperature=temperature,
+                mu=enc_mu,
+                sigma=enc_sigma,
+            )
 
-            print(
-                f"Epoch {epoch_1idx}/{total_role_epochs} (T={temperature:.3f}): "
-                f"Train MSE={avg_mse:.6f}, Val MSE={val_mse:.6f}, "
-                f"Train R²={train_r2:.6f}, Val R²={val_r2:.6f}, "
-                f"Pairwise diversity={avg_pairwise_div:.6f}"
+            val_filler_independence = evaluate_filler_independence(
+                role_model,
+                test_set,
+                batch_size=INDEPENDENCE_EVAL_BATCH_SIZE,
+                temperature=temperature,
+            )
+
+            val_filler_mi = compute_filler_role_mutual_information(
+                role_model,
+                test_set,
+                device,
+                temperature=temperature,
             )
 
             role_val_mse_hist.append(val_mse)
             role_train_r2_hist.append(train_r2)
             role_val_r2_hist.append(val_r2)
+            role_filler_mi_hist.append(val_filler_mi)
+            role_eval_epochs.append(epoch_1idx)
+
+            print(f"Validation filler-role MI = {val_filler_mi:.4f} bits")
+
+            combined_val_score = (
+                    float(val_mse)
+                    + EARLY_STOP_INDEPENDENCE_WEIGHT
+                    * float(val_filler_independence)
+            )
+
+            improvement = best_score - combined_val_score
+
+            if improvement > EARLY_STOPPING_MIN_DELTA:
+                best_score = combined_val_score
+                best_role_epoch_1idx = epoch_1idx
+                best_role_mse = float(val_mse)
+                best_role_filler_independence = float(
+                    val_filler_independence
+                )
+
+                early_stop_counter = 0
+
+                torch.save(
+                    {
+                        "model_state_dict": role_model.state_dict(),
+                        "epoch": epoch_1idx,
+                        "val_mse": best_role_mse,
+                        "val_filler_independence": (
+                            best_role_filler_independence
+                        ),
+                        "combined_val_score": best_score,
+                        "temperature": temperature,
+                    },
+                    best_role_path,
+                )
+
+                print(
+                    f"  ✓ Saved best ROLE model: {best_role_path}\n"
+                    f"    epoch={best_role_epoch_1idx} | "
+                    f"val_mse={best_role_mse:.6f} | "
+                    f"val_filler_indep="
+                    f"{best_role_filler_independence:.6f} | "
+                    f"combined_score={best_score:.6f}"
+                )
+
+            else:
+                if epoch_1idx >= EARLY_STOPPING_WARMUP:
+                    early_stop_counter += 1
+
+                print(
+                    f"  No combined-score improvement: "
+                    f"{early_stop_counter}/"
+                    f"{EARLY_STOPPING_PATIENCE}"
+                )
+
+            print(
+                f"Epoch {epoch_1idx}/{total_role_epochs} "
+                f"(T={temperature:.3f}): "
+                f"Optimization MSE={avg_mse:.6f}, "
+                f"Train Eval MSE={train_eval_mse:.6f}, "
+                f"Val MSE={val_mse:.6f}, "
+                f"Train R²={train_r2:.6f}, "
+                f"Val R²={val_r2:.6f}, "
+                f"Pairwise diversity={avg_pairwise_div:.6f}, "
+                f"Train filler independence="
+                f"{avg_filler_independence:.6f}, "
+                f"Val filler independence="
+                f"{val_filler_independence:.6f}, "
+                f"Combined score={combined_val_score:.6f}"
+            )
+
+            if (
+                    epoch_1idx >= EARLY_STOPPING_WARMUP
+                    and early_stop_counter >= EARLY_STOPPING_PATIENCE
+            ):
+                print(
+                    "\nEarly stopping triggered:\n"
+                    f"  Current epoch: {epoch_1idx}\n"
+                    f"  Best epoch: {best_role_epoch_1idx}\n"
+                    f"  Best validation MSE: "
+                    f"{best_role_mse:.6f}\n"
+                    f"  Best validation filler independence: "
+                    f"{best_role_filler_independence:.6f}\n"
+                    f"  Best combined score: {best_score:.6f}"
+                )
+
+                stopped_early = True
         else:
             print(
                 f"Epoch {epoch_1idx}/{total_role_epochs} (T={temperature:.3f}): "
-                f"Train MSE={avg_mse:.6f}, (skipping val; interval={EVAL_INTERVAL}) "
+                f"Optimization MSE={avg_mse:.6f}, "
+                f"Train Eval MSE={train_eval_mse:.6f}, "
+                f"(skipping validation; interval={EVAL_INTERVAL}) "
                 f"Pairwise diversity={avg_pairwise_div:.6f}"
             )
-            role_val_mse_hist.append(float("nan"))
-            role_train_r2_hist.append(float("nan"))
-            role_val_r2_hist.append(float("nan"))
 
         if PLOT_ROLE_DISTS and (epoch_1idx == 1 or epoch_1idx == total_role_epochs or epoch_1idx % ROLE_PLOT_EVERY == 0):
             summaries = snapshot_role_distributions(
@@ -927,50 +1827,123 @@ def main():
                 epoch_idx=epoch_0idx,
                 max_items=ROLE_SAMPLE_SIZE,
                 temperature=temperature,
+                plot_role_bboxes=PLOT_ROLE_BBOXES,
+                bbox_lookup=bbox_lookup,
+                label_to_filler_id=label_to_filler_id,
             )
             role_entropy_hist.append(summaries["entropy"])
             role_sparsity_hist.append(summaries["sparsity"])
             role_snapshot_epochs.append(epoch_1idx)
 
+        # ---------------------------------------------------------
+        # LIVE TRAINING PLOTS
+        # ---------------------------------------------------------
+        # Re-generate the plot files after every epoch. The same
+        # filenames are overwritten, so opening/refreshing them during
+        # training shows the most recent histories available.
+        plot_training_curves(
+            role_train_mse_hist,
+            role_val_mse_hist,
+            role_train_r2_hist,
+            role_val_r2_hist,
+            role_train_one_hot=role_train_one_hot_hist,
+            role_train_l2=role_train_l2_hist,
+            role_train_filler_independence=role_filler_independence_hist,
+            role_filler_mi=role_filler_mi_hist,
+            role_eval_epochs=role_eval_epochs,
+            role_train_pairwise_diversity=role_pairwise_div_hist,
+        )
+
+        # Save raw histories every epoch so any plot can be regenerated later.
+        torch.save(
+            {
+                "optimization_mse": role_optimization_mse_hist,
+                "train_eval_mse_every_epoch": role_train_mse_hist,
+                "val_mse": role_val_mse_hist,
+                "train_r2": role_train_r2_hist,
+                "val_r2": role_val_r2_hist,
+                "pairwise_diversity": role_pairwise_div_hist,
+                "filler_independence": role_filler_independence_hist,
+                "filler_mi": role_filler_mi_hist,
+                "eval_epochs": role_eval_epochs,
+            },
+            "role_training_history.pt",
+        )
+
+        # Update role entropy/sparsity summary plots whenever a new
+        # role-distribution snapshot was created.
+        if (
+            PLOT_ROLE_DISTS
+            and role_entropy_hist
+            and (
+                epoch_1idx == 1
+                or epoch_1idx == total_role_epochs
+                or epoch_1idx % ROLE_PLOT_EVERY == 0
+            )
+        ):
+            plot_role_summaries(
+                role_entropy_hist,
+                role_sparsity_hist,
+                role_epochs=role_snapshot_epochs,
+                out_dir=ROLE_OUT_DIR,
+            )
+
+        if stopped_early:
+            break
+
     # Load best ROLE model before decoder training / substitution eval
     try:
-        role_model.load_state_dict(torch.load(best_role_path, map_location=device))
+        checkpoint = torch.load(
+            best_role_path,
+            map_location=device,
+        )
+
+        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+            role_model.load_state_dict(
+                checkpoint["model_state_dict"]
+            )
+        else:
+            # Compatibility with older state-dict-only checkpoints
+            role_model.load_state_dict(checkpoint)
         print(f"\nLoaded best ROLE model from {best_role_path}")
         if best_role_epoch_1idx is not None:
-            print(f"  Best epoch: {best_role_epoch_1idx} | mse={best_role_mse:.6f}")
+            print(f"  Best epoch: {best_role_epoch_1idx}")
+            print(f"  Best val MSE: {best_role_mse:.6f}")
+            print(
+                f"  Best val filler independence: "
+                f"{best_role_filler_independence:.6f}"
+            )
+            print(
+                f"  Best combined score: "
+                f"{best_score:.6f}"
+            )
     except FileNotFoundError:
         print(f"\nWARNING: Best ROLE checkpoint not found at {best_role_path}. Using current in-memory model.")
 
-    # Plot training curves
-    plot_training_curves(
-        role_train_mse_hist,
-        role_val_mse_hist,
-        role_train_r2_hist,
-        role_val_r2_hist,
-        role_train_one_hot=role_train_one_hot_hist,
-        role_train_l2=role_train_l2_hist,
-        role_train_entropy=role_pairwise_div_hist,
-    )
-
+    # Training curves and role-summary plots were updated throughout training.
     if PLOT_ROLE_DISTS and role_entropy_hist:
-        plot_role_summaries(
-            role_entropy_hist,
-            role_sparsity_hist,
-            role_epochs=role_snapshot_epochs,
-            out_dir=ROLE_OUT_DIR,
-        )
         print(f"Saved role assignment distribution plots to: {ROLE_OUT_DIR}")
 
     print("\n" + "=" * 80)
     print("TRAINING COMPLETE!")
     print("=" * 80)
-    print(f"\nFinal Results:")
-    print(f"  ROLE Model:")
+    print("\nFinal Results:")
+    print("  ROLE Model:")
+
     if best_role_epoch_1idx is not None:
-        print(f"    Best epoch:    {best_role_epoch_1idx}")
-        print(f"    Best val MSE:  {best_role_mse:.6f}")
+        print(f"    Best epoch: {best_role_epoch_1idx}")
+        print(f"    Best val MSE: {best_role_mse:.6f}")
+        print(
+            f"    Best val filler independence: "
+            f"{best_role_filler_independence:.6f}"
+        )
+        print(
+            f"    Best combined score: "
+            f"{best_score:.6f}"
+        )
     else:
-        print(f"    Best checkpoint info: N/A")
+        print("    No checkpoint was saved.")
+
     print(f"\nRole offset applied: {role_offset}")
 
 
