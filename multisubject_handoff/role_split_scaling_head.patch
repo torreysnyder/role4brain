@@ -1,0 +1,372 @@
+--- a/role_approx_fmri.py	2026-10-08 19:48:18.530721242 +0200
++++ b/role_approx_fmri.py	2026-10-08 19:50:08.457937865 +0200
+@@ -140,12 +140,21 @@
+         target_roles=None,
+         image_id=None,
+         split=None,
++        fmri_row=None,
++        subject=None,
++        aligned=False,
++        coco_split=None,
+     ):
+         self.filler = filler                    # LongTensor [1, seq_len]
+         self.target_encoding = target_encoding  # FloatTensor [1, encoding_dim]
+         self.target_roles = target_roles        # LongTensor [1, seq_len]
+         self.image_id = image_id
+         self.split = split
++        # Fields written by multisubject_handoff/build_nsd_role_inputs.py.
++        self.fmri_row = fmri_row
++        self.subject = subject
++        self.aligned = aligned        # True for rows mapped from another subject
++        self.coco_split = coco_split  # COCO split, when `split` is train/val/test
+ 
+ # --------------------
+ # Data loading
+@@ -238,6 +247,10 @@
+                 role_t,
+                 image_id=image_id,
+                 split=split,
++                fmri_row=fmri_row,
++                subject=entry.get('subject'),
++                aligned=bool(entry.get('aligned', False)),
++                coco_split=entry.get('coco_split'),
+             )
+         )
+ 
+@@ -262,13 +275,28 @@
+ # Training helpers
+ # --------------------
+ 
+-def compute_target_stats(data):
+-    """Compute mean and std over target_encoding features."""
++def compute_target_stats(data, scaling="per_dim"):
++    """Compute mean and scale over target_encoding features.
++
++    scaling="per_dim" divides every dimension by its own SD. On PCA targets that
++    whitens them: each component gets equal weight in the loss whatever its
++    variance, so low-variance, mostly-noise components weigh as much as the
++    first. scaling="global" divides every dimension by one shared scale (the
++    root mean variance), which keeps the components' relative weights and makes
++    the loss proportional to vertex-space MSE. See
++    multisubject_handoff/TARGETS_AND_WHITENING.md.
++    """
+     with torch.no_grad():
+         xs = [inst.target_encoding.view(-1).cpu().numpy() for inst in data]
+         X = np.stack(xs, axis=0)
+         mu = torch.from_numpy(X.mean(axis=0)).float()
+-        sigma = torch.from_numpy(X.std(axis=0) + 1e-6).float()
++        if scaling == "per_dim":
++            sigma = torch.from_numpy(X.std(axis=0) + 1e-6).float()
++        elif scaling == "global":
++            scale = float(np.sqrt(X.var(axis=0).mean())) + 1e-6
++            sigma = torch.full_like(mu, scale)
++        else:
++            raise ValueError(f"unknown target scaling {scaling!r}")
+     return mu, sigma
+ 
+ 
+@@ -427,25 +455,36 @@
+ 
+ 
+ @torch.no_grad()
+-def evaluate_role(role_model, data, temperature=1.0, mu=None, sigma=None):
+-    """Evaluate ROLE MSE and R² on dataset."""
++def evaluate_role(role_model, data, temperature=1.0, mu=None, sigma=None,
++                  multioutput="uniform_average", return_predictions=False):
++    """Evaluate ROLE MSE and R² on dataset.
++
++    multioutput="uniform_average" averages R² over target dimensions with equal
++    weight (legacy). On PCA targets that weighs the last component like the
++    first; "variance_weighted" gives 1 - total SSE / total SS instead.
++    With return_predictions=True, also returns the raw model outputs (target
++    units, before any standardization), one row per instance.
++    """
+     role_model.eval()
+ 
+     preds = []
+     targets = []
++    raw_preds = []
+ 
+-    for inst in data:
+-        pred, _ = role_model(inst.filler, None, temperature=temperature)
+-
+-        pred = pred.view(pred.size(0), -1)
+-        targ = inst.target_encoding.view(inst.target_encoding.size(0), -1)
++    with torch.no_grad():
++        for inst in data:
++            pred, _ = role_model(inst.filler, None, temperature=temperature)
+ 
+-        if mu is not None and sigma is not None:
+-            pred = _standardize(pred, mu, sigma)
+-            targ = _standardize(targ, mu, sigma)
++            pred = pred.view(pred.size(0), -1)
++            targ = inst.target_encoding.view(inst.target_encoding.size(0), -1)
++            raw_preds.append(pred.cpu().numpy())
++
++            if mu is not None and sigma is not None:
++                pred = _standardize(pred, mu, sigma)
++                targ = _standardize(targ, mu, sigma)
+ 
+-        preds.append(pred.cpu().numpy())
+-        targets.append(targ.cpu().numpy())
++            preds.append(pred.cpu().numpy())
++            targets.append(targ.cpu().numpy())
+ 
+     preds = np.concatenate(preds, axis=0)
+     targets = np.concatenate(targets, axis=0)
+@@ -455,9 +494,11 @@
+     r2 = r2_score(
+         targets,
+         preds,
+-        multioutput="uniform_average"
++        multioutput=multioutput
+     )
+ 
++    if return_predictions:
++        return mse, r2, np.concatenate(raw_preds, axis=0)
+     return mse, r2
+ 
+ @torch.no_grad()
+@@ -637,9 +678,11 @@
+ 
+     ids_by_split = defaultdict(list)
+     for inst in instances:
+-        if inst.image_id is None or inst.split is None:
++        # NSD inputs keep the COCO split in `coco_split`; `split` is train/val/test.
++        coco_split = getattr(inst, "coco_split", None) or inst.split
++        if inst.image_id is None or coco_split is None:
+             continue
+-        ids_by_split[str(inst.split)].append(inst.image_id)
++        ids_by_split[str(coco_split)].append(inst.image_id)
+ 
+     for split in list(ids_by_split.keys()):
+         ids_by_split[split] = list(dict.fromkeys(ids_by_split[split]))
+@@ -1416,9 +1459,26 @@
+     # =========================
+     FMRI_METADATA_JSON = "fmri_metadata_pca8.json"
+     FMRI_TARGETS_NPY = "fmri_targets_pca8.npy"
+-    TARGET_ENCODING_DIM = 8
++    TARGET_ENCODING_DIM = 8     # None = infer from the targets file
+     SEED = 42
+ 
++    # --- NSD inputs from multisubject_handoff/build_nsd_role_inputs.py -------
++    # SPLIT_FROM_METADATA: use each record's `split` (train/val/test) instead of
++    # the random 80/20 split. Validation drives early stopping and checkpoint
++    # selection; the test set is touched once, after training. Target stats come
++    # from real training rows only (aligned rows have ridge-shrunk variance).
++    SPLIT_FROM_METADATA = False
++    # "per_dim" (legacy) whitens PCA targets; "global" keeps their relative
++    # variances. See multisubject_handoff/TARGETS_AND_WHITENING.md.
++    TARGET_SCALING = "per_dim"
++    R2_MULTIOUTPUT = "uniform_average"   # or "variance_weighted"
++    # Projection head: hidden width (None = output width, legacy) and the
++    # output LayerNorm (True = legacy).
++    PROJECTION_HIDDEN_DIM = None
++    OUTPUT_LAYER_NORM = True
++    # Raw test/val predictions (target units) for multisubject_handoff/vertex_eval.py
++    PREDICTIONS_OUT = "role_predictions.npz"
++
+     # Early stopping
+     EARLY_STOPPING_PATIENCE = 30
+     EARLY_STOPPING_MIN_DELTA = 1e-4
+@@ -1525,24 +1585,37 @@
+     print(f"  Target encoding dimension: {encoding_dim}")
+     print(f"  TPR dim (filler_dim * role_dim): {FILLER_DIM * ROLE_DIM}")
+ 
++    if SPLIT_FROM_METADATA:
++        train_set = [inst for inst in data if inst.split == "train"]
++        val_set = [inst for inst in data if inst.split == "val"]
++        test_set = [inst for inst in data if inst.split == "test"]
++        stats_set = [inst for inst in train_set if not inst.aligned]
++        print(f"\nTrain: {len(train_set)} ({len(train_set) - len(stats_set)} aligned), "
++              f"Val: {len(val_set)}, Test: {len(test_set)}")
++    else:
++        split_indices = list(range(len(data)))
++        split_rng = random.Random(SEED)
++        split_rng.shuffle(split_indices)
++
++        split_idx = int(0.8 * len(split_indices))
++
++        train_indices = split_indices[:split_idx]
++        test_indices = split_indices[split_idx:]
++
++        train_set = [data[i] for i in train_indices]
++        test_set = [data[i] for i in test_indices]
++        # Legacy behaviour: the held-out 20% doubles as the validation set.
++        val_set = test_set
++        stats_set = data
++        print(f"\nTrain: {len(train_set)}, Test (also used for validation): {len(test_set)}")
++
+     # Compute statistics for standardization
+-    enc_mu, enc_sigma = compute_target_stats(data) if STANDARDIZE else (None, None)
++    enc_mu, enc_sigma = (
++        compute_target_stats(stats_set, TARGET_SCALING) if STANDARDIZE else (None, None)
++    )
+     if STANDARDIZE:
+         print(f"  Encoding mean: {enc_mu.mean().item():.4f}")
+-        print(f"  Encoding std: {enc_sigma.mean().item():.4f}")
+-
+-    split_indices = list(range(len(data)))
+-    split_rng = random.Random(SEED)
+-    split_rng.shuffle(split_indices)
+-
+-    split_idx = int(0.8 * len(split_indices))
+-
+-    train_indices = split_indices[:split_idx]
+-    test_indices = split_indices[split_idx:]
+-
+-    train_set = [data[i] for i in train_indices]
+-    test_set = [data[i] for i in test_indices]
+-    print(f"\nTrain: {len(train_set)}, Test: {len(test_set)}")
++        print(f"  Encoding std: {enc_sigma.mean().item():.4f} ({TARGET_SCALING} scaling)")
+ 
+     # Prepare bbox metadata once for the fixed snapshot images, rather than
+     # reloading COCO detections at every snapshot epoch.
+@@ -1553,7 +1626,7 @@
+         with open(FILLER_VOCAB_JSON, "r") as f:
+             label_to_filler_id = json.load(f)
+ 
+-        snapshot_instances = test_set[: min(ROLE_SAMPLE_SIZE, len(test_set))]
++        snapshot_instances = val_set[: min(ROLE_SAMPLE_SIZE, len(val_set))]
+         bbox_lookup = build_coco_bbox_lookup(snapshot_instances)
+ 
+     train_batches = batchify_with_roles(train_set, BATCH_SIZE)
+@@ -1582,7 +1655,7 @@
+         n_fillers=num_fillers,
+         filler_dim=FILLER_DIM,
+         role_dim=ROLE_DIM,
+-        final_layer_width=TARGET_ENCODING_DIM,  # projects ROLE output -> 16-dim PCA fMRI target
++        final_layer_width=encoding_dim,  # projects ROLE output -> fMRI target width
+         binder="tpr",
+         role_learner_hidden_dim=HIDDEN_DIM,
+         num_layers=NUM_LAYERS,
+@@ -1593,6 +1666,8 @@
+         embedder_squeeze=64,                    # squeezes BERT 768-dim -> 64-dim before binding
+         unique_role_regularization_weight=0.1,  # disabled: not meaningful for dense role embeddings
+         pretrained_filler_embeddings=pretrained_filler_embeddings,
++        projection_hidden_dim=PROJECTION_HIDDEN_DIM,
++        output_layer_norm=OUTPUT_LAYER_NORM,
+     ).to(device)
+     role_model.use_regularization(USE_ROLE_REG)
+ 
+@@ -1648,6 +1723,7 @@
+     best_role_epoch_1idx = None
+     best_role_mse = float("inf")
+     best_role_filler_independence = float("inf")
++    best_temperature = T_END  # temperature at the selected checkpoint
+ 
+     early_stop_counter = 0
+     stopped_early = False
+@@ -1685,6 +1761,7 @@
+             temperature=temperature,
+             mu=enc_mu,
+             sigma=enc_sigma,
++            multioutput=R2_MULTIOUTPUT,
+         )
+         role_train_mse_hist.append(train_eval_mse)
+ 
+@@ -1700,22 +1777,23 @@
+ 
+             val_mse, val_r2 = evaluate_role(
+                 role_model,
+-                test_set,
++                val_set,
+                 temperature=temperature,
+                 mu=enc_mu,
+                 sigma=enc_sigma,
++                multioutput=R2_MULTIOUTPUT,
+             )
+ 
+             val_filler_independence = evaluate_filler_independence(
+                 role_model,
+-                test_set,
++                val_set,
+                 batch_size=INDEPENDENCE_EVAL_BATCH_SIZE,
+                 temperature=temperature,
+             )
+ 
+             val_filler_mi = compute_filler_role_mutual_information(
+                 role_model,
+-                test_set,
++                val_set,
+                 device,
+                 temperature=temperature,
+             )
+@@ -1740,6 +1818,7 @@
+                 best_score = combined_val_score
+                 best_role_epoch_1idx = epoch_1idx
+                 best_role_mse = float(val_mse)
++                best_temperature = temperature
+                 best_role_filler_independence = float(
+                     val_filler_independence
+                 )
+@@ -1822,7 +1901,7 @@
+ 
+         if PLOT_ROLE_DISTS and (epoch_1idx == 1 or epoch_1idx == total_role_epochs or epoch_1idx % ROLE_PLOT_EVERY == 0):
+             summaries = snapshot_role_distributions(
+-                role_model, test_set, device,
++                role_model, val_set, device,
+                 out_dir=ROLE_OUT_DIR,
+                 epoch_idx=epoch_0idx,
+                 max_items=ROLE_SAMPLE_SIZE,
+@@ -1946,6 +2025,23 @@
+ 
+     print(f"\nRole offset applied: {role_offset}")
+ 
++    if SPLIT_FROM_METADATA:
++        # The only access to the test split: after every selection decision,
++        # at the temperature the selected checkpoint was validated at.
++        outputs = {}
++        for name, subset in (("test", test_set), ("val", val_set)):
++            mse, r2, raw = evaluate_role(
++                role_model, subset, temperature=best_temperature, mu=enc_mu, sigma=enc_sigma,
++                multioutput=R2_MULTIOUTPUT, return_predictions=True,
++            )
++            print(f"  {name}: MSE={mse:.6f}  R2 ({R2_MULTIOUTPUT})={r2:.6f}")
++            outputs[f"{name}_fmri_row"] = np.array([inst.fmri_row for inst in subset])
++            outputs[f"{name}_prediction"] = raw
++        # vertex_eval.py reads `fmri_row` / `prediction`; the test split is the default.
++        np.savez(PREDICTIONS_OUT, fmri_row=outputs["test_fmri_row"],
++                 prediction=outputs["test_prediction"], **outputs)
++        print(f"Saved raw predictions to {PREDICTIONS_OUT}")
++
+ 
+ if __name__ == "__main__":
+     try:
+--- a/role_learning_tensor_product_encoder.py	2026-10-08 19:48:18.530721242 +0200
++++ b/role_learning_tensor_product_encoder.py	2026-10-08 19:48:28.567017917 +0200
+@@ -44,6 +44,8 @@
+             role_assignment_shrink_filler_dim=None,
+             embedder_squeeze=None,
+             pretrained_filler_embeddings=None,  # (num_fillers, filler_dim) tensor; if provided, frozen
++            projection_hidden_dim=None,  # hidden width of the projection head; None = final_layer_width (legacy)
++            output_layer_norm=True,  # LayerNorm on the output (legacy); fixes every prediction's norm
+     ):
+         super().__init__()
+ 
+@@ -122,14 +124,21 @@
+         # ---- Canonical projection head (binder_output_dim -> final_layer_width) ----
+         # ALWAYS create this if final_layer_width is specified
+         if self.final_layer_width is not None:
+-            print(f"[RoleEncoder] Creating projection: {self.binder_output_dim} -> {self.final_layer_width}")
++            # The legacy head's hidden width equals the output width, which is an
++            # 8-unit ReLU bottleneck at 8 PCs and a (D x D) layer at D outputs.
++            hidden = projection_hidden_dim or self.final_layer_width
++            print(f"[RoleEncoder] Creating projection: {self.binder_output_dim} -> "
++                  f"{hidden} -> {self.final_layer_width}")
+             self.final_proj = nn.Sequential(
+-                nn.Linear(self.binder_output_dim, self.final_layer_width),
++                nn.Linear(self.binder_output_dim, hidden),
+                 nn.ReLU(),
+                 nn.Dropout(self.dropout),
+-                nn.Linear(self.final_layer_width, self.final_layer_width),
++                nn.Linear(hidden, self.final_layer_width),
+             )
+-            self.post_norm = nn.LayerNorm(self.final_layer_width)
++            # LayerNorm over the outputs gives every prediction the same norm
++            # before its affine, so the model cannot predict a weak vs a strong
++            # response. Disable it for regression onto brain responses.
++            self.post_norm = nn.LayerNorm(self.final_layer_width) if output_layer_norm else None
+         else:
+             print(f"[RoleEncoder] No projection layer (final_layer_width=None)")
+             self.final_proj = None
