@@ -4,9 +4,25 @@ import torch
 import torch.nn as nn
 
 # Import custom binding operations
-from binding_operations import CircularConvolution, EltWise, SumFlattenedOuterProduct
+from binding_operations import CircularConvolution, EltWise
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+
+class SumFlattenedOuterProduct(nn.Module):
+    """Sum filler-role outer products over sequence, independently per image.
+
+    Input tensors: (S, B, D_f) and (S, B, D_r).
+    Output: (B, D_f * D_r). No reduction over the batch axis.
+    """
+
+    def forward(self, fillers, roles):
+        if fillers.ndim != 3 or roles.ndim != 3 or fillers.shape[:2] != roles.shape[:2]:
+            raise ValueError(
+                f"Expected matching (S, B, D) inputs; got {tuple(fillers.shape)} "
+                f"and {tuple(roles.shape)}"
+            )
+        return torch.einsum("sbf,sbr->bfr", fillers, roles).flatten(start_dim=1)
 
 
 class RoleLearningTensorProductEncoder(nn.Module):
@@ -163,8 +179,13 @@ class RoleLearningTensorProductEncoder(nn.Module):
             fillers_embedded = self.embedding_squeeze_layer(fillers_embedded)
         fillers_embedded = fillers_embedded.transpose(0, 1)  # (S, B, filler_dim)
 
-        # 3) Bind fillers × roles -> (B, binder_output_dim)
-        bound = self.sum_layer(fillers_embedded, roles_embedded)
+        # 3) Bind fillers x roles independently for each image (sum over S).
+        # Exclude PAD tokens even if embedding/projection biases are nonzero.
+        if self.binder in ("tpr", "tensor", "tpr_sum"):
+            valid = (filler_list != 0).transpose(0, 1).unsqueeze(-1)
+            bound = self.sum_layer(fillers_embedded * valid, roles_embedded)
+        else:
+            bound = self.sum_layer(fillers_embedded, roles_embedded)
 
         # 4) Project to target width if specified
         if self.final_proj is not None:

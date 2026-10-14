@@ -8,6 +8,7 @@ Modifications from original ROLE (Soulos et al. 2020):
   - Entropy regularization
   - fMRI responses as target encodings (replaces TPDN encodings)
   - Checkpoint selection via pure val MSE
+  - Straight-through Gumbel-Softmax training (hard forward, soft backward)
 """
 
 import sys
@@ -77,44 +78,61 @@ def _role_logits_to_bsr(role_logits, batch_size):
         f"and batch_size={batch_size}"
     )
 
-def filler_role_independence_loss(role_probs, filler_ids, eps=1e-8):
+def filler_independence_loss_from_probs(
+    role_probs,
+    filler_ids,
+    pad_mask=None,
+    eps=1e-8,
+):
     """
-    Penalize filler-specific role distributions that are too different
-    from the batch-level role distribution.
+    Equal-per-filler KL independence loss:
 
+        mean_f KL(P(role | filler=f) || P(role))
+
+    Each unique filler category receives equal weight.
     """
-    pad_mask = filler_ids != 0
 
-    p = role_probs[pad_mask]
-    ids = filler_ids[pad_mask]
+    B, S, R = role_probs.shape
 
-    if p.size(0) == 0:
-        return role_probs.new_tensor(0.0)
+    role_probs_flat = role_probs.reshape(-1, R)
+    filler_ids_flat = filler_ids.reshape(-1)
 
-    # Global role distribution across all non-PAD tokens
-    p_global = p.mean(dim=0).detach()
+    # Remove PAD positions
+    if pad_mask is not None:
+        valid = pad_mask.reshape(-1).bool()
+        role_probs_flat = role_probs_flat[valid]
+        filler_ids_flat = filler_ids_flat[valid]
+
+    if role_probs_flat.shape[0] == 0:
+        return role_probs.sum() * 0.0
+
+    # P(role): marginal role distribution across valid tokens
+    p_role = role_probs_flat.mean(dim=0)
+
+    unique_fillers = torch.unique(filler_ids_flat)
 
     losses = []
 
-    for fid in torch.unique(ids):
-        fid_mask = ids == fid
+    for filler in unique_fillers:
 
-        # Need at least 2 occurrences to estimate filler-specific usage
-        if fid_mask.sum() < 2:
-            continue
+        mask_f = filler_ids_flat == filler
 
-        p_filler = p[fid_mask].mean(dim=0)
+        # P(role | filler=f)
+        p_role_given_filler = role_probs_flat[mask_f].mean(dim=0)
 
-        # KL(p_filler || p_global)
+        # KL(P(role | filler=f) || P(role))
         kl = (
-            p_filler
-            * (torch.log(p_filler + eps) - torch.log(p_global + eps))
+            p_role_given_filler
+            * (
+                torch.log(p_role_given_filler + eps)
+                - torch.log(p_role + eps)
+            )
         ).sum()
 
         losses.append(kl)
 
     if len(losses) == 0:
-        return role_probs.new_tensor(0.0)
+        return role_probs.sum() * 0.0
 
     return torch.stack(losses).mean()
 
@@ -130,6 +148,56 @@ def pairwise_diversity_loss_from_probs(role_probs, pad_mask=None):
         offdiag = offdiag * valid
 
     return (sim * offdiag).sum() / offdiag.sum().clamp_min(1.0)
+
+
+def token_entropy_loss_from_probs(role_probs, pad_mask=None, eps=1e-8):
+    """Encourage confident (low-entropy) role assignments at non-PAD positions."""
+    token_entropy = -(role_probs * torch.log(role_probs + eps)).sum(dim=-1)
+    if pad_mask is not None:
+        valid = pad_mask.float()
+        return (token_entropy * valid).sum() / valid.sum().clamp_min(1.0)
+    return token_entropy.mean()
+
+
+def one_hot_loss_from_probs(role_probs, pad_mask=None):
+    """Encourage one-hot role assignments using confirmed probabilities.
+
+    For a valid probability vector p, sum_r p_r(1-p_r) is non-negative,
+    equals 0 for a one-hot assignment, and is maximized by the uniform
+    distribution (0.875 for 8 roles). PAD positions are excluded.
+    """
+    per_token = (role_probs * (1.0 - role_probs)).sum(dim=-1)
+    if pad_mask is not None:
+        valid = pad_mask.float()
+        return (per_token * valid).sum() / valid.sum().clamp_min(1.0)
+    return per_token.mean()
+
+
+def role_balance_loss_from_probs(role_probs, pad_mask=None, eps=1e-8):
+    """Encourage balanced global use of all roles via KL(P(role) || Uniform).
+
+    This is equivalent, up to an additive constant, to maximizing the entropy
+    of the marginal role distribution. It complements token entropy: token
+    entropy sharpens each assignment, while this term encourages the full
+    role vocabulary to be used across tokens.
+    """
+    B, S, R = role_probs.shape
+    probs = role_probs.reshape(-1, R)
+
+    if pad_mask is not None:
+        valid = pad_mask.reshape(-1).bool()
+        probs = probs[valid]
+
+    if probs.shape[0] == 0:
+        return role_probs.sum() * 0.0
+
+    p_role = probs.mean(dim=0)
+    uniform = torch.full_like(p_role, 1.0 / R)
+
+    return (
+        p_role
+        * (torch.log(p_role + eps) - torch.log(uniform + eps))
+    ).sum()
 
 
 class RoleLearningInstance(object):
@@ -297,6 +365,9 @@ def train_epoch_role(
         mu=None, sigma=None,
         role_diversity_weight=0.01,
         filler_independence_weight=0.01,
+        token_entropy_weight=0.0,
+        role_balance_weight=0.0,
+        one_hot_weight=0.0,
         lambda_div=1.0
 ):
     """Train ROLE for one epoch to match TPDN encodings."""
@@ -310,6 +381,8 @@ def train_epoch_role(
     total_l2 = 0.0
     total_pairwise_div = 0.0
     total_filler_independence = 0.0
+    total_token_entropy = 0.0
+    total_role_balance = 0.0
     num_updates = 0
 
     for batch in tqdm(train_batches, desc=f"Training ROLE (T={temperature:.2f})"):
@@ -344,11 +417,19 @@ def train_epoch_role(
         # Pairwise role diversity regularization.
         # This directly penalizes pairs of non-PAD tokens within the same image
         # when they have similar role-assignment distributions.
-        if role_diversity_weight > 0:
+        if any(w > 0 for w in (
+            role_diversity_weight,
+            filler_independence_weight,
+            token_entropy_weight,
+            role_balance_weight,
+            one_hot_weight,
+        )):
             role_probs = None
 
             if hasattr(model, "role_assigner") and hasattr(model.role_assigner, "last_role_probs"):
-                role_probs = model.role_assigner.last_role_probs
+                role_probs = (model.role_assigner.last_role_soft_probs
+                              if model.role_assigner.use_gumbel_st
+                              else model.role_assigner.last_role_probs)
 
             if role_probs is None:
                 role_logits = _role_logits_to_bsr(
@@ -370,41 +451,57 @@ def train_epoch_role(
                 pad_mask=pad_mask
             )
 
-            filler_indep_loss = filler_role_independence_loss(role_probs, filler_batch)
+            filler_indep_loss = filler_independence_loss_from_probs(role_probs, filler_batch, pad_mask=pad_mask)
+            token_ent_loss = token_entropy_loss_from_probs(role_probs, pad_mask=pad_mask)
+            role_balance_loss = role_balance_loss_from_probs(role_probs, pad_mask=pad_mask)
+            one_hot_loss = one_hot_loss_from_probs(role_probs, pad_mask=pad_mask)
 
             total_pairwise_div += float(role_div_loss.item())
             total_filler_independence += float(filler_indep_loss.item())
+            total_token_entropy += float(token_ent_loss.item())
+            total_role_balance += float(role_balance_loss.item())
+
             weighted_role_div = role_diversity_weight * role_div_loss
             weighted_filler_indep = filler_independence_weight * filler_indep_loss
-            loss = loss + weighted_role_div + weighted_filler_indep
+            weighted_token_entropy = token_entropy_weight * token_ent_loss
+            weighted_role_balance = role_balance_weight * role_balance_loss
+            weighted_one_hot = one_hot_weight * one_hot_loss
+
+            loss = (
+                loss
+                + weighted_role_div
+                + weighted_filler_indep
+                + weighted_token_entropy
+                + weighted_role_balance
+                + weighted_one_hot
+            )
+
+            # Store the weighted one-hot contribution, matching the historical
+            # role_train_one_hot history semantics.
+            total_one_hot += float(weighted_one_hot.item())
 
             # Debug print once per epoch
             if num_updates == 0:
                 print(
                     f"MSE={mse_loss.item():.4f} | "
                     f"role_div={role_div_loss.item():.4f} | "
-                    f"weighted_role_div={weighted_role_div.item():.4f}"
-                    f"filler_indep_loss={filler_indep_loss.item():.4f} | "
-                    f"weighted_filler_indep={weighted_filler_indep.item():.4f}"
+                    f"weighted_role_div={weighted_role_div.item():.4f} | "
+                    f"filler_indep={filler_indep_loss.item():.4f} | "
+                    f"weighted_filler_indep={weighted_filler_indep.item():.4f} | "
+                    f"token_entropy={token_ent_loss.item():.4f} | "
+                    f"weighted_token_entropy={weighted_token_entropy.item():.4f} | "
+                    f"role_balance={role_balance_loss.item():.4f} | "
+                    f"weighted_role_balance={weighted_role_balance.item():.4f} | "
+                    f"one_hot={one_hot_loss.item():.4f} | "
+                    f"weighted_one_hot={weighted_one_hot.item():.4f}"
                 )
 
-        # Optional regularization.
-        # We intentionally drop unique_loss because #sequence positions can exceed
-        # #role indices; uniqueness is therefore not the right constraint here.
-        if use_regularization:
-            one_hot_loss, l2_loss, _ = model.get_regularization_loss(role_predictions)
-            reg_loss = one_hot_loss + l2_loss
-            loss = loss + reg_loss
+        # Legacy model.get_regularization_loss(role_predictions) is intentionally
+        # not used here. One-hot regularization is computed above from confirmed
+        # role probabilities and excludes PAD tokens. L2/unique-role terms remain off.
+        total_l2 += 0.0
 
-            total_one_hot += float(one_hot_loss.item())
-            total_l2 += float(l2_loss.item())
-
-        # Optional legacy entropy regularization. Keep disabled when using
-        # pairwise_diversity_loss unless explicitly experimenting.
-        if entropy_weight > 0:
-            role_probs = F.softmax(_role_logits_to_bsr(role_predictions, batch_size=filler_batch.size(0)) / max(temperature, 1e-8), dim=-1)
-            ent_loss = entropy_weight * entropy_loss(role_probs)
-            loss = loss + ent_loss
+        # Legacy entropy block disabled: PAD-aware token entropy is applied above.
 
         # Backward
         loss.backward()
@@ -422,7 +519,9 @@ def train_epoch_role(
         total_one_hot / denom,
         total_l2 / denom,
         total_pairwise_div / denom,
-        total_filler_independence/denom,
+        total_filler_independence / denom,
+        total_token_entropy / denom,
+        total_role_balance / denom,
     )
 
 
@@ -537,7 +636,7 @@ def evaluate_filler_independence(
     role_probs = torch.cat(all_role_probs, dim=0)
     filler_ids = torch.cat(all_filler_ids, dim=0)
 
-    independence_loss = filler_role_independence_loss(
+    independence_loss = filler_independence_loss_from_probs(
         role_probs,
         filler_ids,
     )
@@ -621,6 +720,154 @@ def compute_filler_role_mutual_information(
     ).sum()
 
     return float(mi)
+
+@torch.no_grad()
+def evaluate_role_utilization_diagnostics(
+    role_model,
+    data,
+    batch_size=64,
+    temperature=1.0,
+    eps=1e-12,
+):
+    """Compute validation-set soft/argmax utilization diagnostics over non-PAD tokens.
+
+    Returns
+    -------
+    dict with:
+      soft_utilization: mean P(role) across valid tokens, shape [R]
+      argmax_utilization: fraction of valid tokens whose winning role is r, shape [R]
+      dsa: total-variation distance between soft and argmax utilization
+           = 0.5 * sum_r |soft_r - argmax_r|. Lower means closer agreement.
+      argmax_entropy: entropy of the argmax-utilization distribution in nats.
+      active_argmax_roles: number of roles with at least one argmax-winning token.
+    """
+    role_model.eval()
+    soft_sum = None
+    argmax_counts = None
+    n_valid = 0
+
+    for start in range(0, len(data), batch_size):
+        batch = data[start:start + batch_size]
+        filler_batch = torch.cat([inst.filler for inst in batch], dim=0)
+
+        _, role_predictions = role_model(
+            filler_batch, None, temperature=temperature
+        )
+
+        role_probs = None
+        if (
+            hasattr(role_model, "role_assigner")
+            and hasattr(role_model.role_assigner, "last_role_probs")
+        ):
+            role_probs = role_model.role_assigner.last_role_probs
+
+        if role_probs is None:
+            role_logits = _role_logits_to_bsr(
+                role_predictions, batch_size=filler_batch.size(0)
+            )
+            role_probs = F.softmax(
+                role_logits / max(temperature, 1e-8), dim=-1
+            )
+
+        if role_probs.size(0) != filler_batch.size(0):
+            if role_probs.size(1) == filler_batch.size(0):
+                role_probs = role_probs.transpose(0, 1)
+            else:
+                raise RuntimeError(
+                    f"Could not align role_probs shape {tuple(role_probs.shape)} "
+                    f"with batch size {filler_batch.size(0)}"
+                )
+
+        valid = (filler_batch != 0).reshape(-1)
+        probs = role_probs.reshape(-1, role_probs.size(-1))[valid]
+        if probs.numel() == 0:
+            continue
+
+        if soft_sum is None:
+            soft_sum = torch.zeros(
+                probs.size(-1), device=probs.device, dtype=probs.dtype
+            )
+            argmax_counts = torch.zeros_like(soft_sum)
+
+        soft_sum += probs.sum(dim=0)
+        winners = probs.argmax(dim=-1)
+        argmax_counts += torch.bincount(
+            winners, minlength=probs.size(-1)
+        ).to(argmax_counts.dtype)
+        n_valid += int(probs.size(0))
+
+    if n_valid == 0:
+        return {
+            "soft_utilization": np.array([]),
+            "argmax_utilization": np.array([]),
+            "dsa": float("nan"),
+            "argmax_entropy": float("nan"),
+            "active_argmax_roles": 0,
+        }
+
+    soft = soft_sum / float(n_valid)
+    argmax = argmax_counts / float(n_valid)
+    dsa = 0.5 * torch.abs(soft - argmax).sum()
+    argmax_entropy = -(argmax * torch.log(argmax + eps)).sum()
+    active = int((argmax_counts > 0).sum().item())
+
+    return {
+        "soft_utilization": soft.detach().cpu().numpy(),
+        "argmax_utilization": argmax.detach().cpu().numpy(),
+        "dsa": float(dsa.item()),
+        "argmax_entropy": float(argmax_entropy.item()),
+        "active_argmax_roles": active,
+    }
+
+
+def plot_role_utilization_diagnostics(
+    eval_epochs,
+    dsa_hist,
+    argmax_entropy_hist,
+    active_argmax_roles_hist,
+    n_roles,
+):
+    """Plot validation soft-vs-argmax discrepancy diagnostics over training."""
+    if not eval_epochs:
+        return
+
+    eval_epochs = np.asarray(eval_epochs, dtype=int)
+
+    plt.figure(figsize=(10, 6))
+    plt.plot(eval_epochs, dsa_hist, marker="o")
+    plt.xlabel("Epoch")
+    plt.ylabel("Dsa (total variation distance)")
+    plt.title("ROLE Model - Soft vs. Argmax Utilization Discrepancy")
+    plt.grid(True, linestyle="--", alpha=0.5)
+    plt.tight_layout()
+    plt.savefig("role_dsa_over_epochs.png", dpi=200)
+    plt.close()
+
+    plt.figure(figsize=(10, 6))
+    plt.plot(eval_epochs, argmax_entropy_hist, marker="o", label="Argmax entropy")
+    plt.axhline(np.log(n_roles), linestyle="--", label=f"Maximum = ln({n_roles})")
+    plt.xlabel("Epoch")
+    plt.ylabel("Entropy (nats)")
+    plt.title("ROLE Model - Argmax Utilization Entropy")
+    plt.grid(True, linestyle="--", alpha=0.5)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("role_argmax_entropy_over_epochs_oh.png", dpi=200)
+    plt.close()
+
+    plt.figure(figsize=(10, 6))
+    plt.plot(eval_epochs, active_argmax_roles_hist, marker="o")
+    plt.axhline(n_roles, linestyle="--", label=f"All roles = {n_roles}")
+    plt.xlabel("Epoch")
+    plt.ylabel("Number of active argmax roles")
+    plt.title("ROLE Model - Active Argmax Roles")
+    plt.yticks(range(0, n_roles + 1))
+    plt.grid(True, linestyle="--", alpha=0.5)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("role_active_argmax_roles_over_epochs_oh.png", dpi=200)
+    plt.close()
+
 
 def build_coco_bbox_lookup(instances, label_field="ground_truth"):
     """Build a COCO ground-truth bbox lookup for the requested ROLE instances."""
@@ -1038,7 +1285,7 @@ def plot_role_summaries(role_entropy_hist, role_sparsity_hist, role_epochs=None,
     plt.grid(True, linestyle="--", alpha=0.5)
     plt.legend()
     plt.tight_layout()
-    plt.savefig(os.path.join(out_dir, "role_entropy_over_epochs.png"), dpi=200)
+    plt.savefig(os.path.join(out_dir, "role_entropy_over_epochs_oh.png"), dpi=200)
     plt.close()
 
     plt.figure(figsize=(10, 6))
@@ -1049,7 +1296,7 @@ def plot_role_summaries(role_entropy_hist, role_sparsity_hist, role_epochs=None,
     plt.grid(True, linestyle="--", alpha=0.5)
     plt.legend()
     plt.tight_layout()
-    plt.savefig(os.path.join(out_dir, "role_sparsity_over_epochs.png"), dpi=200)
+    plt.savefig(os.path.join(out_dir, "role_sparsity_over_epochs_oh.png"), dpi=200)
     plt.close()
 
 def plot_training_curves(
@@ -1222,7 +1469,7 @@ def plot_training_curves(
         plt.tight_layout()
 
         plt.savefig(
-            "role_mse_reweighted_fi_role_div.png",
+            "role_mse_oh.png",
             dpi=200,
         )
 
@@ -1254,7 +1501,7 @@ def plot_training_curves(
         plt.tight_layout()
 
         plt.savefig(
-            "role_r2_reweighted_fi_role_div.png",
+            "role_r2_oh.png",
             dpi=200,
         )
         plt.close()
@@ -1288,7 +1535,7 @@ def plot_training_curves(
         plt.tight_layout()
 
         plt.savefig(
-            "role_model_filler_independence_loss_reweighted_fi_role_div.png",
+            "role_model_filler_indep_oh.png",
             dpi=200,
         )
         plt.close()
@@ -1322,7 +1569,7 @@ def plot_training_curves(
         plt.tight_layout()
 
         plt.savefig(
-            "role_model_pairwise_diversity_loss_reweighted_fi_role_div.png",
+            "role_model_pairwise_diversity_loss_oh.png",
             dpi=200,
         )
         plt.close()
@@ -1349,7 +1596,7 @@ def plot_training_curves(
         plt.tight_layout()
 
         plt.savefig(
-            "role_model_filler_role_mutual_information_reweighted_fi_role_div.png",
+            "role_model_filler_role_mutual_information_oh.png",
             dpi=200,
         )
         plt.close()
@@ -1396,7 +1643,7 @@ def plot_training_curves(
         plt.tight_layout()
 
         plt.savefig(
-            "role_model_legacy_regularization_losses_reweighted_fi_role_div.png",
+            "role_model_reg_loss_oh.png",
             dpi=200,
         )
         plt.close()
@@ -1434,7 +1681,8 @@ def main():
     TOTAL_ROLE_EPOCHS = 150
     BATCH_SIZE = 4              # reduced from 16 to lower GPU memory usage
     ROLE_LR = 1e-4
-    USE_ROLE_REG = False
+    USE_ROLE_REG = True
+    USE_GUMBEL_ST = True  # hard role selection forward; soft gradients backward
     STANDARDIZE = True
 
     # Runtime: validate less frequently
@@ -1444,17 +1692,29 @@ def main():
     T_START = 5.0
     T_END = 0.5
 
-    # Entropy regularizationm
-    # Legacy entropy regularization. Set to 0 because the new loss below
-    # already contains a token-entropy term.
-    ENTROPY_WEIGHT = 0.0
+    # Per-token sharpness regularization.
+    # Lower entropy means a more confident role distribution for each non-PAD filler.
+    # For 8 roles, maximum entropy is ln(8) ~= 2.079 nats.
+    TOKEN_ENTROPY_WEIGHT = 0.5
+
+    # PAD-aware one-hot sharpness regularization computed directly from role_probs.
+    # For N_ROLES=8, the raw loss is in [0, 0.875] for valid probabilities.
+    ONE_HOT_WEIGHT = 0.1
+
+    # Global role-balance regularization.
+    # Minimizes KL(P(role) || Uniform), encouraging all N_ROLES to be used
+    # across non-PAD tokens. Do not add a separate marginal-entropy loss:
+    # for a uniform target it has the same gradient up to a constant.
+    ROLE_BALANCE_WEIGHT = 0.05
 
     # Pairwise role diversity regularization.
     # ROLE_DIVERSITY_WEIGHT controls the overall contribution to the training loss.
     # LAMBDA_DIV controls how strongly pairwise within-image role dissimilarity is
     # penalized relative to sharp token-level assignments.
-    ROLE_DIVERSITY_WEIGHT = 4.9
-    FILLER_INDEPENDENCE_WEIGHT = 1.05
+    # ABLATION: pairwise-diversity term is disabled. The raw diversity
+    # diagnostic is still computed/tracked, but contributes 0 to the objective.
+    ROLE_DIVERSITY_WEIGHT = 5.0
+    FILLER_INDEPENDENCE_WEIGHT = 1.0
     LAMBDA_DIV = 1.0
 
     # Model architecture
@@ -1473,7 +1733,7 @@ def main():
 
     # Role assignment distribution tracking
     PLOT_ROLE_DISTS = True
-    ROLE_OUT_DIR = "role_bbox_images_reweighted_fi_role_div"
+    ROLE_OUT_DIR = "role_gumbel_st"
     ROLE_PLOT_EVERY = 5  # snapshot every N epochs
     ROLE_SAMPLE_SIZE = 25
 
@@ -1591,9 +1851,12 @@ def main():
         dropout=DROPOUT,
         softmax_roles=True,
         embedder_squeeze=64,                    # squeezes BERT 768-dim -> 64-dim before binding
-        unique_role_regularization_weight=0.1,  # disabled: not meaningful for dense role embeddings
+        unique_role_regularization_weight=0.0,
+        one_hot_regularization_weight=0.0,  # handled explicitly from role_probs below
         pretrained_filler_embeddings=pretrained_filler_embeddings,
     ).to(device)
+    role_model.role_assigner.use_gumbel_st = USE_GUMBEL_ST
+    role_model.role_assigner.gumbel_hard_eval = True
     role_model.use_regularization(USE_ROLE_REG)
 
     # =========================
@@ -1604,8 +1867,11 @@ def main():
     print(f"\nROLE training plan:")
     print(f"  Training from scratch for {total_role_epochs} epochs")
     print(f"  Temperature annealing: {T_START} → {T_END}")
-    print(f"  Legacy entropy regularization weight: {ENTROPY_WEIGHT}")
+    print(f"  Token entropy / sharpness weight: {TOKEN_ENTROPY_WEIGHT}")
+    print(f"  One-hot sharpness weight: {ONE_HOT_WEIGHT}")
+    print(f"  Role balance weight: {ROLE_BALANCE_WEIGHT}")
     print(f"  Role diversity weight: {ROLE_DIVERSITY_WEIGHT}")
+    print("  Pairwise-diversity ablation: ENABLED (weight = 0; diagnostic still tracked)")
     print(f"  Pairwise diversity lambda: {LAMBDA_DIV}")
     print(f"  Validation interval: every {EVAL_INTERVAL} epochs")
     print(
@@ -1630,6 +1896,8 @@ def main():
     role_train_l2_hist = []
     role_pairwise_div_hist = []
     role_filler_independence_hist = []
+    role_token_entropy_hist = []
+    role_balance_hist = []
 
     # Evaluation epochs only:
     role_train_mse_hist = []
@@ -1637,6 +1905,11 @@ def main():
     role_train_r2_hist = []
     role_val_r2_hist = []
     role_filler_mi_hist = []
+    role_dsa_hist = []
+    role_argmax_entropy_hist = []
+    role_active_argmax_roles_hist = []
+    role_soft_utilization_hist = []
+    role_argmax_utilization_hist = []
 
     role_entropy_hist = []
     role_sparsity_hist = []
@@ -1644,6 +1917,7 @@ def main():
     role_eval_epochs = []
 
     best_role_path = "best_role_model_fmri_pca16.pt"
+    latest_role_path = "latest_role_training_checkpoint.pt"
     best_score = float("inf")
     best_role_epoch_1idx = None
     best_role_mse = float("inf")
@@ -1655,18 +1929,21 @@ def main():
     for epoch_0idx in range(start_epoch_0idx, total_role_epochs):
         temperature = get_temperature(epoch_0idx, total_role_epochs, T_START, T_END)
 
-        _, avg_mse, avg_one_hot, avg_l2, avg_pairwise_div, avg_filler_independence = train_epoch_role(
+        _, avg_mse, avg_one_hot, avg_l2, avg_pairwise_div, avg_filler_independence, avg_token_entropy, avg_role_balance = train_epoch_role(
             role_model,
             train_batches,
             role_optimizer,
             role_criterion,
             use_regularization=USE_ROLE_REG,
             temperature=temperature,
-            entropy_weight=ENTROPY_WEIGHT,
+            entropy_weight=0.0,
             mu=enc_mu,
             sigma=enc_sigma,
             role_diversity_weight=ROLE_DIVERSITY_WEIGHT,
             filler_independence_weight=FILLER_INDEPENDENCE_WEIGHT,
+            token_entropy_weight=TOKEN_ENTROPY_WEIGHT,
+            role_balance_weight=ROLE_BALANCE_WEIGHT,
+            one_hot_weight=ONE_HOT_WEIGHT,
             lambda_div=LAMBDA_DIV
         )
 
@@ -1675,6 +1952,8 @@ def main():
         role_train_l2_hist.append(avg_l2)
         role_pairwise_div_hist.append(avg_pairwise_div)
         role_filler_independence_hist.append(avg_filler_independence)
+        role_token_entropy_hist.append(avg_token_entropy)
+        role_balance_hist.append(avg_role_balance)
 
         # Recompute TRAIN MSE in eval mode after EVERY epoch.
         # This is the blue curve and is directly comparable to validation MSE.
@@ -1720,13 +1999,30 @@ def main():
                 temperature=temperature,
             )
 
+            utilization_diag = evaluate_role_utilization_diagnostics(
+                role_model,
+                test_set,
+                batch_size=INDEPENDENCE_EVAL_BATCH_SIZE,
+                temperature=temperature,
+            )
+
             role_val_mse_hist.append(val_mse)
             role_train_r2_hist.append(train_r2)
             role_val_r2_hist.append(val_r2)
             role_filler_mi_hist.append(val_filler_mi)
             role_eval_epochs.append(epoch_1idx)
+            role_dsa_hist.append(utilization_diag["dsa"])
+            role_argmax_entropy_hist.append(utilization_diag["argmax_entropy"])
+            role_active_argmax_roles_hist.append(utilization_diag["active_argmax_roles"])
+            role_soft_utilization_hist.append(utilization_diag["soft_utilization"].tolist())
+            role_argmax_utilization_hist.append(utilization_diag["argmax_utilization"].tolist())
 
             print(f"Validation filler-role MI = {val_filler_mi:.4f} bits")
+            print(
+                f"Validation role utilization: Dsa={utilization_diag['dsa']:.6f} | "
+                f"argmax entropy={utilization_diag['argmax_entropy']:.6f} nats | "
+                f"active argmax roles={utilization_diag['active_argmax_roles']}/{n_roles}"
+            )
 
             combined_val_score = (
                     float(val_mse)
@@ -1788,6 +2084,7 @@ def main():
                 f"Train R²={train_r2:.6f}, "
                 f"Val R²={val_r2:.6f}, "
                 f"Pairwise diversity={avg_pairwise_div:.6f}, "
+                f"Role balance={avg_role_balance:.6f}, "
                 f"Train filler independence="
                 f"{avg_filler_independence:.6f}, "
                 f"Val filler independence="
@@ -1817,7 +2114,8 @@ def main():
                 f"Optimization MSE={avg_mse:.6f}, "
                 f"Train Eval MSE={train_eval_mse:.6f}, "
                 f"(skipping validation; interval={EVAL_INTERVAL}) "
-                f"Pairwise diversity={avg_pairwise_div:.6f}"
+                f"Pairwise diversity={avg_pairwise_div:.6f}, "
+                f"Role balance={avg_role_balance:.6f}"
             )
 
         if PLOT_ROLE_DISTS and (epoch_1idx == 1 or epoch_1idx == total_role_epochs or epoch_1idx % ROLE_PLOT_EVERY == 0):
@@ -1854,6 +2152,14 @@ def main():
             role_train_pairwise_diversity=role_pairwise_div_hist,
         )
 
+        plot_role_utilization_diagnostics(
+            role_eval_epochs,
+            role_dsa_hist,
+            role_argmax_entropy_hist,
+            role_active_argmax_roles_hist,
+            n_roles,
+        )
+
         # Save raw histories every epoch so any plot can be regenerated later.
         torch.save(
             {
@@ -1864,10 +2170,58 @@ def main():
                 "val_r2": role_val_r2_hist,
                 "pairwise_diversity": role_pairwise_div_hist,
                 "filler_independence": role_filler_independence_hist,
+                "token_entropy": role_token_entropy_hist,
+                "role_balance": role_balance_hist,
                 "filler_mi": role_filler_mi_hist,
                 "eval_epochs": role_eval_epochs,
+                "dsa": role_dsa_hist,
+                "argmax_entropy": role_argmax_entropy_hist,
+                "active_argmax_roles": role_active_argmax_roles_hist,
+                "soft_utilization": role_soft_utilization_hist,
+                "argmax_utilization": role_argmax_utilization_hist,
             },
             "role_training_history.pt",
+        )
+
+        # Save the latest training state every epoch for interruption recovery.
+        # Unlike best_role_path, this always represents the most recently
+        # completed epoch and includes optimizer + histories needed to resume.
+        torch.save(
+            {
+                "epoch": epoch_1idx,
+                "model_state_dict": role_model.state_dict(),
+                "optimizer_state_dict": role_optimizer.state_dict(),
+                "temperature": temperature,
+                "best_score": best_score,
+                "best_role_epoch_1idx": best_role_epoch_1idx,
+                "best_role_mse": best_role_mse,
+                "best_role_filler_independence": best_role_filler_independence,
+                "early_stop_counter": early_stop_counter,
+                "histories": {
+                    "optimization_mse": role_optimization_mse_hist,
+                    "train_eval_mse_every_epoch": role_train_mse_hist,
+                    "val_mse": role_val_mse_hist,
+                    "train_r2": role_train_r2_hist,
+                    "val_r2": role_val_r2_hist,
+                    "one_hot": role_train_one_hot_hist,
+                    "l2": role_train_l2_hist,
+                    "pairwise_diversity": role_pairwise_div_hist,
+                    "filler_independence": role_filler_independence_hist,
+                    "token_entropy": role_token_entropy_hist,
+                    "role_balance": role_balance_hist,
+                    "filler_mi": role_filler_mi_hist,
+                    "eval_epochs": role_eval_epochs,
+                    "dsa": role_dsa_hist,
+                    "argmax_entropy": role_argmax_entropy_hist,
+                    "active_argmax_roles": role_active_argmax_roles_hist,
+                    "soft_utilization": role_soft_utilization_hist,
+                    "argmax_utilization": role_argmax_utilization_hist,
+                    "role_entropy": role_entropy_hist,
+                    "role_sparsity": role_sparsity_hist,
+                    "role_snapshot_epochs": role_snapshot_epochs,
+                },
+            },
+            latest_role_path,
         )
 
         # Update role entropy/sparsity summary plots whenever a new

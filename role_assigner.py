@@ -1,6 +1,7 @@
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import itertools
 from typing import Optional
 
@@ -78,6 +79,9 @@ class RoleAssignmentTransformer(nn.Module):
         self.hard_permutation_eval = hard_permutation_eval
         self.last_role_probs: Optional[torch.Tensor] = None  # (B,S,R) post-normalization
         self.last_role_logits: Optional[torch.Tensor] = None  # (B,S,R) raw logits
+        self.last_role_soft_probs: Optional[torch.Tensor] = None
+        self.use_gumbel_st = False
+        self.gumbel_hard_eval = True
 
         # ---- Filler embeddings ----
         self.filler_embedding = filler_embedding
@@ -175,7 +179,7 @@ class RoleAssignmentTransformer(nn.Module):
         x = self.pre_proj(x)
 
         # Positional encoding + transformer
-        #x = self.pos_enc(x.transpose(0, 1)).transpose(0, 1)  # (B, S, D)
+        x = self.pos_enc(x.transpose(0, 1)).transpose(0, 1)  # (B, S, D)
         x = self.encoder(x)
 
         # Predict role logits
@@ -188,21 +192,34 @@ class RoleAssignmentTransformer(nn.Module):
         # This allows for temperature annealing during training
         scaled_logits = logits / max(temperature, 1e-6)
 
-        # Role embeddings (use scaled logits -> assignment here)
-        if self.use_sinkhorn and (self.num_roles == S):
-            # Combine both temperature and sinkhorn_tau
-            # Temperature controls the overall sharpness, sinkhorn_tau is for the algorithm
+        # Gumbel-Softmax straight-through: forward uses a discrete role,
+        # backward differentiates through the soft Gumbel sample.
+        # Evaluation is deterministic (argmax), never Gumbel-sampled.
+        if self.use_gumbel_st:
+            if self.training:
+                role_probs = F.gumbel_softmax(logits, tau=max(float(temperature), 1e-6), hard=True, dim=-1)
+                # Smooth, non-sampled probabilities for regularization/diagnostics.
+                soft_probs = torch.softmax(scaled_logits, dim=-1)
+            else:
+                soft_probs = torch.softmax(scaled_logits, dim=-1)
+                if self.gumbel_hard_eval:
+                    role_probs = F.one_hot(soft_probs.argmax(dim=-1), num_classes=self.num_roles).to(soft_probs.dtype)
+                else:
+                    role_probs = soft_probs
+        elif self.use_sinkhorn and (self.num_roles == S):
             log_alpha = scaled_logits / max(self.sinkhorn_tau, 1e-6)
-            role_probs = sinkhorn_logspace(log_alpha, n_iters=self.sinkhorn_iters)  # (B, S, R)
+            role_probs = sinkhorn_logspace(log_alpha, n_iters=self.sinkhorn_iters)
+            soft_probs = role_probs
         else:
-            # Standard softmax with temperature
-            role_probs = torch.softmax(scaled_logits, dim=-1)  # (B, S, R)
+            role_probs = torch.softmax(scaled_logits, dim=-1)
+            soft_probs = role_probs
 
-        # Optionally harden to a true permutation at evaluation time
-        if (not self.training) and self.hard_permutation_eval and (self.num_roles == S):
+        if (not self.use_gumbel_st) and (not self.training) and self.hard_permutation_eval and (self.num_roles == S):
             role_probs = self._best_permutation_from_probs(role_probs)
 
-        self.last_role_probs = role_probs
+        self.last_role_logits = logits
+        self.last_role_probs = role_probs  # actual assignments used for binding
+        self.last_role_soft_probs = soft_probs  # smooth regularization probabilities
 
         role_table = self.role_embedding.weight
         role_table = role_table / (role_table.norm(dim=1, keepdim=True) + 1e-9)
