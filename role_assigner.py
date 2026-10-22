@@ -179,7 +179,7 @@ class RoleAssignmentTransformer(nn.Module):
         x = self.pre_proj(x)
 
         # Positional encoding + transformer
-        x = self.pos_enc(x.transpose(0, 1)).transpose(0, 1)  # (B, S, D)
+        #x = self.pos_enc(x.transpose(0, 1)).transpose(0, 1)  # (B, S, D) disable positional encoding
         x = self.encoder(x)
 
         # Predict role logits
