@@ -1,0 +1,28 @@
+{
+  "roles": [
+    0,
+    5
+  ],
+  "images_with_both_roles": 136,
+  "comparable_images": 128,
+  "tolerance_fraction_image_diagonal": 0.05,
+  "role_aggregation": "minimum fixation distance across matching instance masks",
+  "skipped": {
+    "missing_role_pair": 102,
+    "missing_matching_masks": 8
+  },
+  "results": {
+    "closer": {
+      "count": 45,
+      "percentage": 35.15625
+    },
+    "farther": {
+      "count": 39,
+      "percentage": 30.46875
+    },
+    "tie": {
+      "count": 44,
+      "percentage": 34.375
+    }
+  }
+}
