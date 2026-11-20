@@ -60,6 +60,8 @@ class RoleLearningTensorProductEncoder(nn.Module):
             role_assignment_shrink_filler_dim=None,
             embedder_squeeze=None,
             pretrained_filler_embeddings=None,  # (num_fillers, filler_dim) tensor; if provided, frozen
+            projection_hidden_dim=None,  # hidden width; None uses final_layer_width
+            output_layer_norm=False,  # disable final LayerNorm for fMRI regression
     ):
         super().__init__()
 
@@ -135,19 +137,29 @@ class RoleLearningTensorProductEncoder(nn.Module):
 
         print(f"[RoleEncoder] Binder '{self.binder}' output dim: {self.binder_output_dim}")
 
-        # ---- Canonical projection head (binder_output_dim -> final_layer_width) ----
-        # ALWAYS create this if final_layer_width is specified
+        # ---- Regression projection head (TPR -> hidden -> output PCs) ----
+        # Hidden width is independent of the number of target PCA components.
+        # Output LayerNorm is OFF by default: it suppresses per-image amplitude.
+        self.projection_hidden_dim = projection_hidden_dim
+        self.output_layer_norm = output_layer_norm
         if self.final_layer_width is not None:
-            print(f"[RoleEncoder] Creating projection: {self.binder_output_dim} -> {self.final_layer_width}")
+            hidden_dim = (self.final_layer_width if projection_hidden_dim is None
+                          else projection_hidden_dim)
+            if not isinstance(hidden_dim, int) or hidden_dim <= 0:
+                raise ValueError("projection_hidden_dim must be a positive integer")
+            print(f"[RoleEncoder] Creating projection: {self.binder_output_dim} -> "
+                  f"{hidden_dim} -> {self.final_layer_width}; "
+                  f"output LayerNorm={output_layer_norm}")
             self.final_proj = nn.Sequential(
-                nn.Linear(self.binder_output_dim, self.final_layer_width),
+                nn.Linear(self.binder_output_dim, hidden_dim),
                 nn.ReLU(),
                 nn.Dropout(self.dropout),
-                nn.Linear(self.final_layer_width, self.final_layer_width),
+                nn.Linear(hidden_dim, self.final_layer_width),
             )
-            self.post_norm = nn.LayerNorm(self.final_layer_width)
+            self.post_norm = (nn.LayerNorm(self.final_layer_width)
+                              if output_layer_norm else None)
         else:
-            print(f"[RoleEncoder] No projection layer (final_layer_width=None)")
+            print("[RoleEncoder] No projection layer (final_layer_width=None)")
             self.final_proj = None
             self.post_norm = None
 
